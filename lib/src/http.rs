@@ -16,12 +16,13 @@ use sozu_command::proxy::RemoveListener;
 use time::{Duration, Instant};
 
 use crate::{
+    protocol::SessionState,
     router::Router,
     sozu_command::{
         logging,
         proxy::{
-            Cluster, HttpFrontend, HttpListener, ProxyEvent, ProxyRequest, ProxyRequestOrder,
-            ProxyResponse, Route,
+            Cluster, HttpFrontend, HttpListener, ProxyRequest, ProxyRequestOrder, ProxyResponse,
+            Route,
         },
         ready::Ready,
         scm_socket::{Listeners, ScmSocket},
@@ -37,20 +38,17 @@ use super::{
     protocol::{
         http::{
             answers::HttpAnswers,
-            parser::{hostname_and_port, Method, RequestState},
+            parser::{hostname_and_port, Method},
             DefaultAnswerStatus,
         },
         proxy_protocol::expect::ExpectProxyProtocol,
-        {Http, Pipe, ProtocolResult, StickySession},
+        {Http, Pipe, ProtocolResult},
     },
-    retry::RetryPolicy,
-    server::{
-        push_event, ListenSession, ListenToken, ProxyChannel, Server, SessionManager, CONN_RETRIES,
-    },
+    server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager},
     socket::server_bind,
     sozu_command::state::ClusterId,
-    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, Protocol,
-    ProxyConfiguration, ProxySession, Readiness, SessionMetrics, SessionResult,
+    AcceptError, Protocol, ProxyConfiguration, ProxySession, Readiness, SessionMetrics,
+    SessionResult,
 };
 
 #[derive(PartialEq, Eq)]
@@ -70,8 +68,6 @@ pub enum State {
 /// 1 session <=> 1 HTTP connection (client to sozu)
 pub struct Session {
     frontend_token: Token,
-    backend: Option<Rc<RefCell<Backend>>>,
-    back_connected: BackendConnectionStatus,
     protocol: Option<State>,
     proxy: Rc<RefCell<Proxy>>,
     pool: Weak<RefCell<Pool>>,
@@ -79,7 +75,6 @@ pub struct Session {
     pub cluster_id: Option<String>,
     sticky_name: String,
     pub listener_token: Token,
-    connection_attempt: u8,
     answers: Rc<RefCell<HttpAnswers>>,
     last_event: Instant,
     front_timeout: TimeoutContainer,
@@ -118,26 +113,24 @@ impl Session {
             let session_address = sock.peer_addr().ok();
             let timeout = TimeoutContainer::new(request_timeout_duration, token);
             State::Http(Http::new(
+                answers.clone(),
+                backend_timeout_duration,
                 sock,
+                frontend_timeout_duration,
+                timeout,
                 token,
-                request_id,
+                listener.clone(),
                 pool.clone(),
+                Protocol::HTTP,
                 public_address,
+                request_id,
                 session_address,
                 sticky_name.clone(),
-                Protocol::HTTP,
-                answers.clone(),
-                timeout,
-                frontend_timeout_duration,
-                backend_timeout_duration,
-                listener.clone(),
             ))
         };
 
         let metrics = SessionMetrics::new(Some(wait_time));
         let mut session = Session {
-            backend: None,
-            back_connected: BackendConnectionStatus::NotConnected,
             protocol: Some(state),
             proxy,
             frontend_token: token,
@@ -148,7 +141,6 @@ impl Session {
             last_event: Instant::now(),
             front_timeout,
             listener_token: listener_token,
-            connection_attempt: 0,
             answers,
             frontend_timeout_duration,
             backend_timeout_duration,
@@ -170,7 +162,7 @@ impl Session {
                 let back_token = unwrap_msg!(http.back_token());
                 let ws_context = http.websocket_context();
 
-                let front_buf = match http.front_buf {
+                let front_buf = match http.frontend_buffer {
                     Some(buf) => buf.buffer,
                     None => {
                         let pool = match self.pool.upgrade() {
@@ -187,7 +179,7 @@ impl Session {
                     }
                 };
 
-                let back_buf = match http.back_buf {
+                let back_buf = match http.backend_buffer {
                     Some(buf) => buf.buffer,
                     None => {
                         let pool = match self.pool.upgrade() {
@@ -209,13 +201,13 @@ impl Session {
                 gauge_add!("http.active_requests", -1);
                 gauge_add!("websocket.active_requests", 1);
                 let mut pipe = Pipe::new(
-                    http.frontend,
+                    http.frontend_socket,
                     front_token,
                     http.request_id,
                     http.cluster_id,
                     http.backend_id,
                     Some(ws_context),
-                    Some(unwrap_msg!(http.backend)),
+                    Some(unwrap_msg!(http.backend_socket)),
                     front_buf,
                     back_buf,
                     http.session_address,
@@ -223,14 +215,14 @@ impl Session {
                     self.listener.clone(),
                 );
 
-                pipe.front_readiness.event = http.front_readiness.event;
-                pipe.back_readiness.event = http.back_readiness.event;
-                http.front_timeout
+                pipe.front_readiness.event = http.frontend_readiness.event;
+                pipe.back_readiness.event = http.backend_readiness.event;
+                http.frontend_timeout
                     .set_duration(self.frontend_timeout_duration);
-                http.back_timeout
+                http.backend_timeout
                     .set_duration(self.backend_timeout_duration);
-                pipe.front_timeout = Some(http.front_timeout);
-                pipe.back_timeout = Some(http.back_timeout);
+                pipe.front_timeout = Some(http.frontend_timeout);
+                pipe.back_timeout = Some(http.backend_timeout);
                 pipe.set_back_token(back_token);
                 //pipe.set_cluster_id(self.cluster_id.clone());
 
@@ -247,21 +239,21 @@ impl Session {
                     Some((Some(public_address), Some(client_address))) => {
                         let readiness = expect.readiness;
                         let mut http = Http::new(
+                            self.answers.clone(),
+                            self.backend_timeout_duration,
                             expect.frontend,
+                            self.frontend_timeout_duration,
+                            self.front_timeout.take(),
                             expect.frontend_token,
-                            expect.request_id,
+                            self.listener.clone(),
                             self.pool.clone(),
+                            Protocol::HTTP,
                             public_address,
+                            expect.request_id,
                             Some(client_address),
                             self.sticky_name.clone(),
-                            Protocol::HTTP,
-                            self.answers.clone(),
-                            self.front_timeout.take(),
-                            self.frontend_timeout_duration,
-                            self.backend_timeout_duration,
-                            self.listener.clone(),
                         );
-                        http.front_readiness.event = readiness.event;
+                        http.frontend_readiness.event = readiness.event;
 
                         gauge_add!("protocol.proxy.expect", -1);
                         gauge_add!("protocol.http", 1);
@@ -281,6 +273,7 @@ impl Session {
         }
     }
 
+    /*
     pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: Option<Rc<Vec<u8>>>) {
         if let State::Http(ref mut http) = *unwrap_msg!(self.protocol.as_mut()) {
             http.set_answer(answer, buf);
@@ -316,6 +309,7 @@ impl Session {
             _ => SessionResult::CloseSession,
         }
     }
+    */
 
     fn log_context(&self) -> String {
         match *unwrap_msg!(self.protocol.as_ref()) {
@@ -330,6 +324,7 @@ impl Session {
         }
     }
 
+    /*
     /// Read content from the frontend
     fn readable(&mut self) -> SessionResult {
         let (upgrade, result) = match *unwrap_msg!(self.protocol.as_mut()) {
@@ -406,6 +401,7 @@ impl Session {
         error!("failed protocol upgrade");
         SessionResult::CloseSession
     }
+    */
 
     fn front_socket(&self) -> &TcpStream {
         match *unwrap_msg!(self.protocol.as_ref()) {
@@ -415,18 +411,27 @@ impl Session {
         }
     }
 
+    fn front_readiness(&mut self) -> &mut Readiness {
+        match *unwrap_msg!(self.protocol.as_mut()) {
+            State::Http(ref mut http) => &mut http.frontend_readiness,
+            State::WebSocket(ref mut pipe) => &mut pipe.front_readiness,
+            State::Expect(ref mut expect) => &mut expect.readiness,
+        }
+    }
+
+    fn back_token(&self) -> Vec<Token> {
+        match *unwrap_msg!(self.protocol.as_ref()) {
+            State::Http(ref http) => http.back_token(),
+            State::WebSocket(ref pipe) => pipe.back_token(),
+            State::Expect(_) => vec![],
+        }
+    }
+
+    /*
     fn back_socket_mut(&mut self) -> Option<&mut TcpStream> {
         match *unwrap_msg!(self.protocol.as_mut()) {
             State::Http(ref mut http) => http.back_socket_mut(),
             State::WebSocket(ref mut pipe) => pipe.back_socket_mut(),
-            State::Expect(_) => None,
-        }
-    }
-
-    fn back_token(&self) -> Option<Token> {
-        match *unwrap_msg!(self.protocol.as_ref()) {
-            State::Http(ref http) => http.back_token(),
-            State::WebSocket(ref pipe) => pipe.back_token(),
             State::Expect(_) => None,
         }
     }
@@ -510,29 +515,6 @@ impl Session {
         &mut self.metrics
     }
 
-    fn remove_backend(&mut self) {
-        /*debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND",
-          self.http().map(|h| h.log_ctx.clone()).unwrap_or_else(|| "".to_string()), self.frontend_token.0,
-          self.back_token().map(|t| format!("{}", t.0)).unwrap_or_else(|| "-".to_string()));
-        */
-
-        if let Some(backend) = self.backend.take() {
-            if let Some(h) = self.http_mut() {
-                h.clear_back_token();
-            }
-
-            backend.borrow_mut().dec_connections();
-        }
-    }
-
-    fn front_readiness(&mut self) -> &mut Readiness {
-        match *unwrap_msg!(self.protocol.as_mut()) {
-            State::Http(ref mut http) => &mut http.front_readiness,
-            State::WebSocket(ref mut pipe) => &mut pipe.front_readiness,
-            State::Expect(ref mut expect) => &mut expect.readiness,
-        }
-    }
-
     fn back_readiness(&mut self) -> Option<&mut Readiness> {
         match *unwrap_msg!(self.protocol.as_mut()) {
             State::Http(ref mut http) => Some(&mut http.back_readiness),
@@ -540,41 +522,7 @@ impl Session {
             _ => None,
         }
     }
-
-    fn fail_backend_connection(&mut self) {
-        if let Some(backend) = &self.backend {
-            let mut backend = backend.borrow_mut();
-            backend.failures += 1;
-
-            let already_unavailable = backend.retry_policy.is_down();
-            backend.retry_policy.fail();
-            incr!(
-                "connections.error",
-                self.cluster_id.as_deref(),
-                self.metrics.backend_id.as_deref()
-            );
-            if !already_unavailable && backend.retry_policy.is_down() {
-                error!(
-                    "backend server {} at {} is down",
-                    backend.backend_id, backend.address
-                );
-                incr!(
-                    "down",
-                    self.cluster_id.as_deref(),
-                    self.metrics.backend_id.as_deref()
-                );
-
-                push_event(ProxyEvent::BackendDown(
-                    backend.backend_id.clone(),
-                    backend.address,
-                ));
-            }
-        }
-    }
-
-    fn reset_connection_attempt(&mut self) {
-        self.connection_attempt = 0;
-    }
+    */
 
     fn cancel_timeouts(&mut self) {
         self.front_timeout.cancel();
@@ -585,649 +533,13 @@ impl Session {
             _ => {}
         }
     }
-
-    fn ready_inner(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionResult {
-        let mut counter = 0;
-        let max_loop_iterations = 100000;
-
-        if self.back_connected().is_connecting()
-            && self
-                .back_readiness()
-                .map(|r| r.event != Ready::empty())
-                .unwrap_or(false)
-        {
-            if let Some(h) = self.http_mut() {
-                h.cancel_backend_timeout();
-            }
-
-            if self
-                .back_readiness()
-                .map(|r| r.event.is_hup())
-                .unwrap_or(false)
-                && !self
-                    .http_mut()
-                    .map(|h| h.test_back_socket())
-                    .unwrap_or(false)
-            {
-                //retry connecting the backend
-                error!(
-                    "{} error connecting to backend, trying again",
-                    self.log_context()
-                );
-
-                self.connection_attempt += 1;
-                self.fail_backend_connection();
-
-                self.back_connected = BackendConnectionStatus::Connecting(Instant::now());
-
-                // trigger a backend reconnection
-                self.close_backend();
-                match self.connect_to_backend(session.clone()) {
-                    // reuse connection or send a default answer, we can continue
-                    Ok(BackendConnectAction::Reuse) => {}
-                    Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
-                        // we must wait for an event
-                        return SessionResult::Continue;
-                    }
-                    Err(connection_error) => {
-                        error!("Error connecting to backend: {:#}", connection_error)
-                    }
-                }
-            } else {
-                self.metrics().backend_connected();
-                self.reset_connection_attempt();
-                self.set_back_connected(BackendConnectionStatus::Connected);
-                // we might get an early response from the backend, so we want to look
-                // at readable events
-                if let Some(r) = self.back_readiness() {
-                    r.interest.insert(Ready::readable());
-                }
-            }
-        }
-
-        if self.front_readiness().event.is_hup() {
-            let order = self.front_hup();
-            if order != SessionResult::CloseSession {
-                self.front_readiness().event.remove(Ready::hup());
-            }
-            return order;
-        }
-
-        let token = self.frontend_token;
-        while counter < max_loop_iterations {
-            let front_interest = self.front_readiness().filter_interest();
-            let back_interest = self
-                .back_readiness()
-                .map(|r| r.interest & r.event)
-                .unwrap_or_else(Ready::empty);
-
-            trace!(
-                "PROXY\t{} {:?} {:?} -> {:?}",
-                self.log_context(),
-                token,
-                self.front_readiness().clone(),
-                self.back_readiness()
-            );
-
-            if front_interest.is_empty() && back_interest.is_empty() {
-                break;
-            }
-
-            if self
-                .back_readiness()
-                .map(|r| r.event.is_hup())
-                .unwrap_or(false)
-                && self.front_readiness().interest.is_writable()
-                && !self.front_readiness().event.is_writable()
-            {
-                break;
-            }
-
-            if front_interest.is_readable() {
-                let session_result = self.readable();
-                trace!(
-                    "front readable\tinterpreting session order {:?}",
-                    session_result
-                );
-
-                match session_result {
-                    SessionResult::ConnectBackend => {
-                        match self.connect_to_backend(session.clone()) {
-                            // reuse connection or send a default answer, we can continue
-                            Ok(BackendConnectAction::Reuse) => {}
-                            Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
-                                // we must wait for an event
-                                return SessionResult::Continue;
-                            }
-                            Err(connection_error) => {
-                                error!("Error connecting to backend: {:#}", connection_error)
-                            }
-                        }
-                    }
-                    SessionResult::Continue => {}
-                    order => return order,
-                }
-            }
-
-            if back_interest.is_writable() {
-                let order = self.back_writable();
-                if order != SessionResult::Continue {
-                    return order;
-                }
-            }
-
-            if back_interest.is_readable() {
-                let order = self.back_readable();
-                if order != SessionResult::Continue {
-                    return order;
-                }
-            }
-
-            if front_interest.is_writable() {
-                let order = self.writable();
-                trace!("front writable\tinterpreting session order {:?}", order);
-
-                if order != SessionResult::Continue {
-                    return order;
-                }
-            }
-
-            if back_interest.is_hup() {
-                let order = self.back_hup();
-                match order {
-                    SessionResult::CloseSession | SessionResult::CloseBackend => {
-                        return order;
-                    }
-                    SessionResult::Continue => {
-                        continue;
-                    }
-                    _ => {
-                        if let Some(r) = self.back_readiness() {
-                            r.event.remove(Ready::hup());
-                        }
-
-                        return order;
-                    }
-                };
-            }
-
-            if front_interest.is_error() {
-                error!(
-                    "PROXY session {:?} front error, disconnecting",
-                    self.frontend_token
-                );
-
-                self.front_readiness().interest = Ready::empty();
-                if let Some(r) = self.back_readiness() {
-                    r.interest = Ready::empty();
-                }
-
-                return SessionResult::CloseSession;
-            }
-
-            if back_interest.is_error() && self.back_hup() == SessionResult::CloseSession {
-                self.front_readiness().interest = Ready::empty();
-                if let Some(r) = self.back_readiness() {
-                    r.interest = Ready::empty();
-                }
-
-                error!(
-                    "PROXY session {:?} back error, disconnecting",
-                    self.frontend_token
-                );
-                return SessionResult::CloseSession;
-            }
-
-            counter += 1;
-        }
-
-        if counter == max_loop_iterations {
-            error!("PROXY\thandling session {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection", self.frontend_token, max_loop_iterations);
-            incr!("http.infinite_loop.error");
-
-            let front_interest = self.front_readiness().interest & self.front_readiness().event;
-            let back_interest = self.back_readiness().map(|r| r.interest & r.event);
-
-            let token = self.frontend_token;
-            let back = self.back_readiness().cloned();
-            error!(
-                "PROXY\t{:?} readiness: {:?} -> {:?} | front: {:?} | back: {:?} ",
-                token,
-                self.front_readiness(),
-                back,
-                front_interest,
-                back_interest
-            );
-            self.print_state();
-
-            return SessionResult::CloseSession;
-        }
-
-        SessionResult::Continue
-    }
-
-    //FIXME: check the token passed as argument
-    fn close_backend(&mut self) {
-        if let Some(token) = self.back_token() {
-            if let Some(fd) = self.back_socket_mut().map(|s| s.as_raw_fd()) {
-                let proxy = self.proxy.borrow();
-                if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
-                    error!("1error deregistering socket({:?}): {:?}", fd, e);
-                }
-
-                proxy.sessions.borrow_mut().slab.try_remove(token.0);
-            }
-
-            self.remove_backend();
-
-            let back_connected = self.back_connected();
-            if back_connected != BackendConnectionStatus::NotConnected {
-                if let Some(r) = self.back_readiness() {
-                    r.event = Ready::empty();
-                }
-
-                if let Some(sock) = self.back_socket_mut() {
-                    if let Err(e) = sock.shutdown(Shutdown::Both) {
-                        if e.kind() != ErrorKind::NotConnected {
-                            error!("error shutting down back socket({:?}): {:?}", sock, e);
-                        }
-                    }
-                }
-            }
-
-            if back_connected == BackendConnectionStatus::Connected {
-                gauge_add!("backend.connections", -1);
-                gauge_add!(
-                    "connections_per_backend",
-                    -1,
-                    self.cluster_id.as_deref(),
-                    self.metrics.backend_id.as_deref()
-                );
-            }
-
-            self.set_back_connected(BackendConnectionStatus::NotConnected);
-
-            if let Some(h) = self.http_mut() {
-                h.clear_back_token();
-                h.remove_backend();
-            }
-        }
-    }
-
-    fn check_circuit_breaker(&mut self) -> anyhow::Result<()> {
-        if self.connection_attempt >= CONN_RETRIES {
-            error!("{} max connection attempt reached", self.log_context());
-            self.set_answer(DefaultAnswerStatus::Answer503, None);
-            bail!("Maximum connection attempt reached");
-        }
-        Ok(())
-    }
-
-    fn check_backend_connection(&mut self) -> bool {
-        let is_valid_backend_socket = self
-            .http_mut()
-            .map(|h| h.is_valid_backend_socket())
-            .unwrap_or(false);
-
-        if !is_valid_backend_socket {
-            return false;
-        }
-
-        //matched on keepalive
-        self.metrics.backend_id = self.backend.as_ref().map(|i| i.borrow().backend_id.clone());
-
-        self.metrics.backend_start();
-        self.http_mut().map(|h| {
-            h.backend_data
-                .as_mut()
-                .map(|b| b.borrow_mut().active_requests += 1)
-        });
-
-        true
-    }
-
-    pub fn get_host(&self) -> Option<&str> {
-        self.protocol.as_ref().and_then(|protocol| match protocol {
-            State::Http(ref http) => http.get_host(),
-            _ => None,
-        })
-    }
-
-    // -> host, path, method
-    pub fn extract_route(&self) -> anyhow::Result<(&str, &str, &Method)> {
-        let given_host = self.get_host().with_context(|| "No host given")?;
-
-        // redundant
-        // we only keep host, but we need the request's hostname in frontend_from_request (calling twice hostname_and_port)
-        let (remaining_input, (hostname, port)) = match hostname_and_port(given_host.as_bytes()) {
-            Ok(tuple) => tuple,
-
-            Err(parse_error) => {
-                // parse_error contains a slice of given_host, which should NOT escape this scope
-                bail!(
-                    "Hostname parsing failed for host {}: {}",
-                    given_host.clone(),
-                    parse_error,
-                );
-            }
-        };
-        if remaining_input != &b""[..] {
-            bail!("invalid remaining chars after hostname {}", given_host);
-        }
-
-        //FIXME: we should check that the port is right too
-
-        let host = if port == Some(&b"80"[..]) {
-            // it is alright to call from_utf8_unchecked,
-            // we already verified that there are only ascii
-            // chars in there
-            unsafe { from_utf8_unchecked(hostname) }
-        } else {
-            given_host
-        };
-
-        let request_line = self
-            .http()
-            .and_then(|http| http.request_state.as_ref())
-            .and_then(|request_state| request_state.get_request_line())
-            .with_context(|| "No request line given in the request state")?;
-
-        Ok((host, &request_line.uri, &request_line.method))
-    }
-
-    fn cluster_id_from_request(&mut self) -> anyhow::Result<String> {
-        let (host, uri, method) = match self.extract_route() {
-            Ok(tuple) => tuple,
-            Err(e) => {
-                self.set_answer(DefaultAnswerStatus::Answer400, None);
-                return Err(e).with_context(|| "Could not extract route from request");
-            }
-        };
-
-        let cluster_id_res = self
-            .proxy
-            .borrow()
-            .listeners
-            .get(&self.listener_token)
-            .with_context(|| "No listener found for this request")?
-            .as_ref()
-            .borrow()
-            .frontend_from_request(host, uri, method);
-
-        let cluster_id = match cluster_id_res {
-            Ok(route) => match route {
-                Route::ClusterId(cluster_id) => cluster_id,
-                Route::Deny => {
-                    self.set_answer(DefaultAnswerStatus::Answer401, None);
-                    bail!("Unauthorized route");
-                }
-            },
-            Err(e) => {
-                let no_host_error = format!("Host not found: {}: {:#}", host, e);
-                self.set_answer(DefaultAnswerStatus::Answer404, None);
-                bail!(no_host_error);
-            }
-        };
-
-        let front_should_redirect_https = self
-            .proxy
-            .borrow()
-            .clusters
-            .get(&cluster_id)
-            .map(|cluster| cluster.https_redirect)
-            .unwrap_or(false);
-
-        if front_should_redirect_https {
-            let answer = format!("HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: https://{}{}\r\n\r\n", host, uri);
-            self.set_answer(
-                DefaultAnswerStatus::Answer301,
-                Some(Rc::new(answer.into_bytes())),
-            );
-            bail!("Route is unauthorized");
-        }
-
-        Ok(cluster_id)
-    }
-
-    pub fn backend_from_request(
-        &mut self,
-        cluster_id: &str,
-        front_should_stick: bool,
-    ) -> anyhow::Result<TcpStream> {
-        let sticky_session = self
-            .http()
-            .and_then(|http| http.request_state.as_ref())
-            .and_then(|request_state| request_state.get_sticky_session());
-
-        let (backend, conn) = match self.get_backend_for_sticky_session(
-            front_should_stick,
-            sticky_session,
-            cluster_id,
-        ) {
-            Ok((b, c)) => (b, c),
-            Err(e) => {
-                self.set_answer(DefaultAnswerStatus::Answer503, None);
-                return Err(e).with_context(|| {
-                    format!("Could not find a backend for cluster {}", cluster_id)
-                });
-            }
-        };
-
-        let listener_token = self.listener_token;
-        if front_should_stick {
-            let sticky_name = &self.proxy.borrow().listeners[&listener_token]
-                .borrow()
-                .config
-                .sticky_name
-                .to_string();
-
-            if let Some(http) = self.http_mut() {
-                // stick backend to session
-                http.sticky_session = Some(StickySession::new(
-                    backend
-                        .borrow()
-                        .sticky_id
-                        .clone()
-                        .unwrap_or_else(|| backend.borrow().backend_id.clone()),
-                ));
-
-                // stick session to listener (how? why?)
-                http.sticky_name = sticky_name.to_string();
-            }
-        }
-
-        self.metrics.backend_id = Some(backend.borrow().backend_id.clone());
-        self.metrics.backend_start();
-        if let Some(http) = self.http_mut() {
-            http.set_backend_id(backend.borrow().backend_id.clone());
-        }
-
-        self.backend = Some(backend);
-        Ok(conn)
-    }
-
-    fn get_backend_for_sticky_session(
-        &self,
-        front_should_stick: bool,
-        sticky_session: Option<&str>,
-        cluster_id: &str,
-    ) -> anyhow::Result<(Rc<RefCell<Backend>>, TcpStream)> {
-        match (front_should_stick, sticky_session) {
-            (true, Some(sticky_session)) => self
-                .proxy
-                .borrow()
-                .backends
-                .borrow_mut()
-                .backend_from_sticky_session(cluster_id, sticky_session)
-                .with_context(|| {
-                    format!(
-                        "Couldn't find a backend corresponding to sticky_session {} for cluster {}",
-                        sticky_session, cluster_id
-                    )
-                }),
-            _ => self
-                .proxy
-                .borrow()
-                .backends
-                .borrow_mut()
-                .backend_from_cluster_id(cluster_id),
-        }
-    }
-
-    fn connect_to_backend(
-        &mut self,
-        session_rc: Rc<RefCell<dyn ProxySession>>,
-    ) -> anyhow::Result<BackendConnectAction> {
-        let old_cluster_id = self.http().and_then(|http| http.cluster_id.clone());
-        let old_back_token = self.back_token();
-
-        self.check_circuit_breaker()
-            .with_context(|| "Circuit broke")?;
-
-        let cluster_id = self
-            .cluster_id_from_request()
-            .with_context(|| "Could not get cluster id from request")?;
-
-        // check if we can reuse the backend connection
-        if (self.http().and_then(|h| h.cluster_id.as_ref()) == Some(&cluster_id))
-            && self.back_connected == BackendConnectionStatus::Connected
-        {
-            let has_backend = self
-                .backend
-                .as_ref()
-                .map(|backend| {
-                    let backend = backend.borrow();
-                    self.proxy
-                        .borrow()
-                        .backends
-                        .borrow()
-                        .has_backend(&cluster_id, &backend)
-                })
-                .unwrap_or(false);
-
-            if has_backend && self.check_backend_connection() {
-                return Ok(BackendConnectAction::Reuse);
-            } else if let Some(token) = self.back_token() {
-                self.close_backend();
-
-                //reset the back token here so we can remove it
-                //from the slab after backend_from* fails
-                self.set_back_token(token);
-            }
-        }
-
-        //replacing with a connection to another cluster
-        if old_cluster_id.is_some() && old_cluster_id.as_ref() != Some(&cluster_id) {
-            if let Some(token) = self.back_token() {
-                self.close_backend();
-
-                //reset the back token here so we can remove it
-                //from the slab after backend_from* fails
-                self.set_back_token(token);
-            }
-        }
-
-        self.cluster_id = Some(cluster_id.clone());
-        if let Some(http) = self.http_mut() {
-            http.cluster_id = Some(cluster_id.clone());
-        }
-
-        let front_should_stick = self
-            .proxy
-            .borrow()
-            .clusters
-            .get(&cluster_id)
-            .map(|cluster| cluster.sticky_session)
-            .unwrap_or(false);
-
-        let mut socket = self.backend_from_request(&cluster_id, front_should_stick)?;
-        if let Err(e) = socket.set_nodelay(true) {
-            error!(
-                "error setting nodelay on back socket({:?}): {:?}",
-                socket, e
-            );
-        }
-
-        if let Some(r) = self.back_readiness() {
-            r.interest = Ready::writable() | Ready::hup() | Ready::error();
-        }
-
-        let connect_timeout = time::Duration::seconds(i64::from(
-            self.proxy
-                .borrow()
-                .listeners
-                .get(&self.listener_token)
-                .as_ref()
-                .map(|listener| listener.borrow().config.connect_timeout)
-                .unwrap(),
-        ));
-
-        self.back_connected = BackendConnectionStatus::Connecting(Instant::now());
-
-        match old_back_token {
-            Some(back_token) => {
-                self.set_back_token(back_token);
-                if let Err(e) = self.proxy.borrow().registry.register(
-                    &mut socket,
-                    back_token,
-                    Interest::READABLE | Interest::WRITABLE,
-                ) {
-                    error!("error registering back socket({:?}): {:?}", socket, e);
-                }
-
-                self.set_back_socket(socket);
-                if let Some(http) = self.http_mut() {
-                    http.set_back_timeout(connect_timeout);
-                }
-
-                Ok(BackendConnectAction::Replace)
-            }
-            None => {
-                let not_enough_memory = {
-                    let proxy = self.proxy.borrow();
-                    let sessions = proxy.sessions.borrow();
-
-                    sessions.slab.len() >= sessions.slab_capacity()
-                };
-
-                if not_enough_memory {
-                    error!("not enough memory, cannot connect to backend");
-                    self.set_answer(DefaultAnswerStatus::Answer503, None);
-                    bail!(format!("Too many connections on cluster {}", cluster_id));
-                }
-
-                let back_token = {
-                    let proxy = self.proxy.borrow();
-                    let mut s = proxy.sessions.borrow_mut();
-                    let entry = s.slab.vacant_entry();
-                    let back_token = Token(entry.key());
-                    let _entry = entry.insert(session_rc);
-                    back_token
-                };
-
-                if let Err(e) = self.proxy.borrow().registry.register(
-                    &mut socket,
-                    back_token,
-                    Interest::READABLE | Interest::WRITABLE,
-                ) {
-                    error!("error registering back socket({:?}): {:?}", socket, e);
-                }
-
-                self.set_back_socket(socket);
-                self.set_back_token(back_token);
-                if let Some(http) = self.http_mut() {
-                    http.set_back_timeout(connect_timeout);
-                }
-
-                Ok(BackendConnectAction::New)
-            }
-        }
-    }
 }
 
 impl ProxySession for Session {
     fn close(&mut self) {
         self.metrics.service_stop();
+
+        // TODO: State should take responsibility for frontend
         self.cancel_timeouts();
         if let Err(e) = self.front_socket().shutdown(Shutdown::Both) {
             if e.kind() != ErrorKind::NotConnected {
@@ -1239,22 +551,19 @@ impl ProxySession for Session {
             }
         }
 
-        self.close_backend();
+        match self.protocol {
+            Some(State::Http(http)) => http.close(self.proxy, &mut self.metrics),
+            Some(State::WebSocket(ws)) => ws.close(),
+            Some(State::Expect(expect)) => {} // expect.close(),
+            None => {}
+        }
 
+        /*
         match self.protocol {
             Some(State::Http(ref mut http)) => {
-                //if the state was initial, the connection was already reset
-                if http.request_state != Some(RequestState::Initial) {
-                    gauge_add!("http.active_requests", -1);
-
-                    if let Some(b) = http.backend_data.as_mut() {
-                        let mut backend = b.borrow_mut();
-                        backend.active_requests = backend.active_requests.saturating_sub(1);
-                    }
-                }
-                gauge_add!("protocol.http", -1)
             }
             Some(State::WebSocket(_)) => {
+                self.close_backend();
                 if let Some(b) = &self.backend {
                     let mut backend = b.borrow_mut();
                     backend.active_requests = backend.active_requests.saturating_sub(1);
@@ -1264,6 +573,7 @@ impl ProxySession for Session {
             Some(State::Expect(_)) => gauge_add!("protocol.proxy.expect", -1),
             None => {}
         }
+        */
 
         let fd = self.front_socket().as_raw_fd();
         let proxy = self.proxy.borrow();
@@ -1309,41 +619,40 @@ impl ProxySession for Session {
         self.last_event = Instant::now();
         self.metrics.wait_start();
 
-        if self.frontend_token == token {
-            self.front_readiness().event |= events;
-        } else if self.back_token() == Some(token) {
-            if let Some(readiness) = self.back_readiness() {
-                readiness.event |= events;
-            }
+        match self.protocol {
+            Some(State::Http(http)) => http.process_events(token, events),
+            _ => {}
         }
     }
 
     fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) {
-        self.metrics().service_start();
+        self.metrics.service_start();
 
-        match self.ready_inner(session) {
-            SessionResult::CloseSession => self.close(),
-            SessionResult::CloseBackend => self.close_backend(),
+        let protocol_result = match self.protocol {
+            Some(State::Http(http)) => http.ready(session, self.proxy, &mut self.metrics),
+            _ => ProtocolResult::Continue,
+        };
+
+        match protocol_result {
+            ProtocolResult::Upgrade => {
+                self.upgrade();
+            }
+            ProtocolResult::Close => self.close(),
+            ProtocolResult::Continue => {}
             _ => (),
         }
 
-        self.metrics().service_stop();
+        self.metrics.service_stop();
     }
 
     fn shutting_down(&mut self) {
         let res = match &mut self.protocol {
-            Some(State::Http(h)) => h.shutting_down(),
-            _ => SessionResult::CloseSession,
+            Some(State::Http(http)) => http.shutting_down(),
+            _ => ProtocolResult::Close,
         };
 
-        if res == SessionResult::CloseSession {
+        if res == ProtocolResult::Close {
             self.close();
-            self.proxy
-                .borrow()
-                .sessions
-                .borrow_mut()
-                .slab
-                .try_remove(self.frontend_token.0);
         }
     }
 
@@ -1361,26 +670,25 @@ impl ProxySession for Session {
 
         let rf = match *unwrap_msg!(self.protocol.as_ref()) {
             State::Expect(ref expect) => &expect.readiness,
-            State::Http(ref http) => &http.front_readiness,
+            State::Http(ref http) => &http.frontend_readiness,
             State::WebSocket(ref pipe) => &pipe.front_readiness,
         };
         let rb = match *unwrap_msg!(self.protocol.as_ref()) {
-            State::Http(ref http) => Some(&http.back_readiness),
+            State::Http(ref http) => Some(&http.backend_readiness),
             State::WebSocket(ref pipe) => Some(&pipe.back_readiness),
             _ => None,
         };
 
-        error!("zombie session[{:?} => {:?}], state => readiness: {:?} -> {:?}, protocol: {}, cluster_id: {:?}, back_connected: {:?}, metrics: {:?}",
-      self.frontend_token, self.back_token(), rf, rb, p, self.cluster_id, self.back_connected, self.metrics);
+        error!(
+            "zombie session[{:?} => {:?}], state => readiness: {:?} -> {:?}, protocol: {}, cluster_id: {:?}, metrics: {:?}",
+            self.frontend_token, self.back_token(), rf, rb, p, self.cluster_id, self.metrics
+        );
     }
 
     fn tokens(&self) -> Vec<Token> {
-        let mut v = vec![self.frontend_token];
-        if let Some(tk) = self.back_token() {
-            v.push(tk)
-        }
-
-        v
+        let mut tokens = self.back_token();
+        tokens.insert(0, self.frontend_token);
+        tokens
     }
 }
 
@@ -1391,7 +699,7 @@ pub struct Listener {
     pub address: SocketAddr,
     fronts: Router,
     answers: Rc<RefCell<HttpAnswers>>,
-    config: HttpListener,
+    pub config: HttpListener,
     pub token: Token,
     pub active: bool,
     tags: BTreeMap<String, BTreeMap<String, String>>,
@@ -1415,12 +723,12 @@ impl ListenerHandler for Listener {
 }
 
 pub struct Proxy {
-    listeners: HashMap<Token, Rc<RefCell<Listener>>>,
-    backends: Rc<RefCell<BackendMap>>,
-    clusters: HashMap<ClusterId, Cluster>,
+    pub listeners: HashMap<Token, Rc<RefCell<Listener>>>,
+    pub backends: Rc<RefCell<BackendMap>>,
+    pub clusters: HashMap<ClusterId, Cluster>,
     pool: Rc<RefCell<Pool>>,
-    registry: Registry,
-    sessions: Rc<RefCell<SessionManager>>,
+    pub registry: Registry,
+    pub sessions: Rc<RefCell<SessionManager>>,
 }
 
 impl Proxy {

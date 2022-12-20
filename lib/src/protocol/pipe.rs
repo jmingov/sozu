@@ -139,8 +139,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         self.backend_status = ConnectionStatus::Normal;
     }
 
-    pub fn back_token(&self) -> Option<Token> {
-        self.backend_token
+    pub fn back_token(&self) -> Vec<Token> {
+        self.backend_token.iter().cloned().collect()
     }
 
     pub fn timeout(&mut self, token: Token, metrics: &mut SessionMetrics) -> SessionResult {

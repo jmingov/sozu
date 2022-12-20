@@ -1025,12 +1025,6 @@ impl ProxySession for Session {
 
     fn shutting_down(&mut self) {
         self.close();
-        self.proxy
-            .borrow()
-            .sessions
-            .borrow_mut()
-            .slab
-            .try_remove(self.frontend_token.0);
     }
 
     fn last_event(&self) -> Instant {

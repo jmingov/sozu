@@ -598,11 +598,11 @@ impl Session {
         }
     }
 
-    fn back_token(&self) -> Option<Token> {
+    fn back_token(&self) -> Vec<Token> {
         match self.state {
             State::Invalid => unreachable!(),
-            State::Expect(_, _) => None,
-            State::Handshake(_) => None,
+            State::Expect(_, _) => vec![],
+            State::Handshake(_) => vec![],
             State::Http(ref http) => http.back_token(),
             State::WebSocket(ref pipe) => pipe.back_token(),
             State::Http2(_) => todo!(),
@@ -1537,12 +1537,6 @@ impl ProxySession for Session {
 
         if session_result == SessionResult::CloseSession {
             self.close();
-            self.proxy
-                .borrow()
-                .sessions
-                .borrow_mut()
-                .slab
-                .try_remove(self.frontend_token.0);
         }
     }
 
