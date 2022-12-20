@@ -73,7 +73,7 @@ use crate::{
     },
     util::UnwrapLog,
     AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ListenerHandler, Protocol,
-    ProxyConfiguration, ProxySession, Readiness, SessionMetrics, SessionResult,
+    ProxyConfiguration, ProxySession, Readiness, SessionMetrics, SessionResult, HttpListenerHandler,
 };
 
 // const SERVER_PROTOS: &[&str] = &["http/1.1", "h2"];
@@ -367,7 +367,7 @@ impl Session {
     fn upgrade_http(&self, mut http: Http<FrontRustls, Listener>) -> Option<State> {
         debug!("https switching to wss");
         let front_token = self.frontend_token;
-        let back_token = unwrap_msg!(http.back_token());
+        let back_token = unwrap_msg!(http.backend_token);
         let ws_context = http.websocket_context();
 
         let front_buf = match http.front_buf {
@@ -1631,6 +1631,52 @@ impl ListenerHandler for Listener {
     }
 }
 
+impl HttpListenerHandler for Listener {
+    fn get_sticky_name(&self) -> &str {
+        &self.config.sticky_name
+    }
+
+    fn get_connect_timeout(&self) -> u32 {
+        &self.config.connect_timeout
+    }
+
+    // TODO factor out with http.rs
+    fn frontend_from_request(
+        &self,
+        host: &str,
+        uri: &str,
+        method: &Method,
+    ) -> anyhow::Result<Route> {
+        let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
+            Ok(tuple) => tuple,
+            Err(parse_error) => {
+                // parse_error contains a slice of given_host, which should NOT escape this scope
+                bail!(
+                    "Hostname parsing failed for host {}: {}",
+                    host.clone(),
+                    parse_error,
+                );
+            }
+        };
+
+        if remaining_input != &b""[..] {
+            bail!(
+                "frontend_from_request: invalid remaining chars after hostname. Host: {}",
+                host
+            );
+        }
+
+        // it is alright to call from_utf8_unchecked,
+        // we already verified that there are only ascii
+        // chars in there
+        let host = unsafe { from_utf8_unchecked(hostname) };
+
+        self.fronts
+            .lookup(host.as_bytes(), uri.as_bytes(), method)
+            .with_context(|| "No cluster found")
+    }
+}
+
 impl CertificateResolver for Listener {
     type Error = ListenerError;
 
@@ -1801,42 +1847,6 @@ impl Listener {
         self.fronts
             .remove_http_front(&tls_front)
             .with_context(|| "Could not remove https frontend")
-    }
-
-    // TODO factor out with http.rs
-    pub fn frontend_from_request(
-        &self,
-        host: &str,
-        uri: &str,
-        method: &Method,
-    ) -> anyhow::Result<Route> {
-        let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
-            Ok(tuple) => tuple,
-            Err(parse_error) => {
-                // parse_error contains a slice of given_host, which should NOT escape this scope
-                bail!(
-                    "Hostname parsing failed for host {}: {}",
-                    host.clone(),
-                    parse_error,
-                );
-            }
-        };
-
-        if remaining_input != &b""[..] {
-            bail!(
-                "frontend_from_request: invalid remaining chars after hostname. Host: {}",
-                host
-            );
-        }
-
-        // it is alright to call from_utf8_unchecked,
-        // we already verified that there are only ascii
-        // chars in there
-        let host = unsafe { from_utf8_unchecked(hostname) };
-
-        self.fronts
-            .lookup(host.as_bytes(), uri.as_bytes(), method)
-            .with_context(|| "No cluster found")
     }
 
     fn accept(&mut self) -> Result<MioTcpStream, AcceptError> {

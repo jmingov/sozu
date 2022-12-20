@@ -29,7 +29,7 @@ use crate::{
     },
     timer::TimeoutContainer,
     util::UnwrapLog,
-    ListenerHandler,
+    ListenerHandler, HttpListenerHandler,
 };
 
 use super::{
@@ -114,7 +114,8 @@ impl Session {
             let timeout = TimeoutContainer::new(request_timeout_duration, token);
             State::Http(Http::new(
                 answers.clone(),
-                backend_timeout_duration,
+                listener.borrow().config.back_timeout,
+                listener.borrow().config.connect_timeout,
                 sock,
                 frontend_timeout_duration,
                 timeout,
@@ -240,7 +241,8 @@ impl Session {
                         let readiness = expect.readiness;
                         let mut http = Http::new(
                             self.answers.clone(),
-                            self.backend_timeout_duration,
+                            self.listener.borrow().config.back_timeout,
+                            self.listener.borrow().config.connect_timeout,
                             expect.frontend,
                             self.frontend_timeout_duration,
                             self.front_timeout.take(),
@@ -722,6 +724,57 @@ impl ListenerHandler for Listener {
     }
 }
 
+impl HttpListenerHandler for Listener {
+    fn get_sticky_name(&self) -> &str {
+        &self.config.sticky_name
+    }
+
+    fn get_connect_timeout(&self) -> u32 {
+        self.config.connect_timeout
+    }
+
+    // redundant, already called once in extract_route
+    fn frontend_from_request(
+        &self,
+        host: &str,
+        uri: &str,
+        method: &Method,
+    ) -> anyhow::Result<Route> {
+        let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
+            Ok(tuple) => tuple,
+            Err(parse_error) => {
+                // parse_error contains a slice of given_host, which should NOT escape this scope
+                bail!(
+                    "Hostname parsing failed for host {}: {}",
+                    host.clone(),
+                    parse_error,
+                );
+            }
+        };
+        if remaining_input != &b""[..] {
+            bail!(
+                "frontend_from_request: invalid remaining chars after hostname. Host: {}",
+                host
+            );
+        }
+
+        /*if port == Some(&b"80"[..]) {
+        // it is alright to call from_utf8_unchecked,
+        // we already verified that there are only ascii
+        // chars in there
+          unsafe { from_utf8_unchecked(hostname) }
+        } else {
+          host
+        }
+        */
+        let host = unsafe { from_utf8_unchecked(hostname) };
+
+        self.fronts
+            .lookup(host.as_bytes(), uri.as_bytes(), method)
+            .with_context(|| "No cluster found")
+    }
+}
+
 pub struct Proxy {
     pub listeners: HashMap<Token, Rc<RefCell<Listener>>>,
     pub backends: Rc<RefCell<BackendMap>>,
@@ -989,47 +1042,6 @@ impl Listener {
             .with_context(|| format!("Could not remove http frontend {:?}", http_front))
     }
 
-    // redundant, already called once in extract_route
-    pub fn frontend_from_request(
-        &self,
-        host: &str,
-        uri: &str,
-        method: &Method,
-    ) -> anyhow::Result<Route> {
-        let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
-            Ok(tuple) => tuple,
-            Err(parse_error) => {
-                // parse_error contains a slice of given_host, which should NOT escape this scope
-                bail!(
-                    "Hostname parsing failed for host {}: {}",
-                    host.clone(),
-                    parse_error,
-                );
-            }
-        };
-        if remaining_input != &b""[..] {
-            bail!(
-                "frontend_from_request: invalid remaining chars after hostname. Host: {}",
-                host
-            );
-        }
-
-        /*if port == Some(&b"80"[..]) {
-        // it is alright to call from_utf8_unchecked,
-        // we already verified that there are only ascii
-        // chars in there
-          unsafe { from_utf8_unchecked(hostname) }
-        } else {
-          host
-        }
-        */
-        let host = unsafe { from_utf8_unchecked(hostname) };
-
-        self.fronts
-            .lookup(host.as_bytes(), uri.as_bytes(), method)
-            .with_context(|| "No cluster found")
-    }
-
     fn accept(&mut self) -> Result<TcpStream, AcceptError> {
         if let Some(ref sock) = self.listener {
             sock.accept()
@@ -1193,6 +1205,7 @@ impl ProxyConfiguration<Session> for Proxy {
             owned.answers.clone(),
             owned.token,
             wait_time,
+            // TODO: this is redundant with Http::new()
             Duration::seconds(owned.config.front_timeout as i64),
             Duration::seconds(owned.config.back_timeout as i64),
             Duration::seconds(owned.config.request_timeout as i64),

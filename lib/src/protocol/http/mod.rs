@@ -29,8 +29,8 @@ use crate::{
     sozu_command::ready::Ready,
     timer::TimeoutContainer,
     util::UnwrapLog,
-    Backend, BackendConnectAction, BackendConnectionStatus, ListenerHandler, LogDuration,
-    ProxySession, {Protocol, Readiness, SessionMetrics, SessionResult},
+    Backend, BackendConnectAction, BackendConnectionStatus, HttpListenerHandler, ListenerHandler,
+    LogDuration, ProxySession, {Protocol, Readiness, SessionMetrics, SessionResult},
 };
 
 use self::parser::{
@@ -101,13 +101,15 @@ pub enum TimeoutStatus {
 /// Http will be contained in State which itself is contained by Session
 ///
 /// TODO: rename me (example: HttpState)
-pub struct Http<Front: SocketHandler, L: ListenerHandler> {
+pub struct Http<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> {
     answers: Rc<RefCell<answers::HttpAnswers>>,
     added_request_header: Option<AddedRequestHeader>,
     added_response_header: String,
     pub backend: Option<Rc<RefCell<Backend>>>,
     pub backend_buffer: Option<BufferQueue>,
     backend_connection_status: BackendConnectionStatus,
+    configured_connect_timeout: u32,
+    configured_backend_timeout: u32,
     pub backend_id: Option<String>,
     pub backend_readiness: Readiness,
     pub backend_socket: Option<TcpStream>,
@@ -116,6 +118,7 @@ pub struct Http<Front: SocketHandler, L: ListenerHandler> {
     backend_token: Option<Token>,
     closing: bool,
     pub cluster_id: Option<String>,
+    // configured_backend_timeout: Duration,
     connection_attempts: u8,
     pub frontend_buffer: Option<BufferQueue>,
     pub frontend_readiness: Readiness,
@@ -139,10 +142,11 @@ pub struct Http<Front: SocketHandler, L: ListenerHandler> {
     sticky_session: Option<StickySession>,
 }
 
-impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
+impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front, L> {
     pub fn new(
         answers: Rc<RefCell<answers::HttpAnswers>>,
-        backend_timeout_duration: Duration,
+        configured_backend_timeout: u32,
+        configured_connect_timeout: u32,
         frontend_socket: Front,
         frontend_timeout_duration: Duration,
         frontend_timeout: TimeoutContainer,
@@ -166,11 +170,15 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
             backend_readiness: Readiness::new(),
             backend_socket: None,
             backend_stop: None,
-            backend_timeout: TimeoutContainer::new_empty(backend_timeout_duration),
+            backend_timeout: TimeoutContainer::new_empty(Duration::seconds(
+                configured_backend_timeout as i64,
+            )),
             backend_token: None,
             backend: None,
             closing: false,
             cluster_id: None,
+            configured_backend_timeout,
+            configured_connect_timeout,
             connection_attempts: 0,
             frontend_buffer: None,
             frontend_readiness: Readiness::new(),
@@ -1549,7 +1557,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
         if !self.backend_timeout.reset() {
             error!(
                 "could not reset back timeout {:?}:\n{}",
-                self.backend_timeout,
+                self.configured_backend_timeout,
                 self.print_state("")
             );
         }
@@ -1895,7 +1903,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
 
 */
 
-impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
+impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front, L> {
     fn remove_backend(&mut self) {
         /*debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND",
           self.http().map(|h| h.log_ctx.clone()).unwrap_or_else(|| "".to_string()), self.frontend_token.0,
@@ -2027,12 +2035,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
             }
         };
 
-        let cluster_id_res = proxy
-            .borrow()
-            .listeners
-            .get(&self.listener_token)
-            .with_context(|| "No listener found for this request")?
-            .as_ref()
+        let cluster_id_res = self
+            .listener
             .borrow()
             .frontend_from_request(host, uri, method);
 
@@ -2098,7 +2102,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
         };
 
         if frontend_should_stick {
-            let sticky_name = self.listener.borrow().config.sticky_name.to_string();
+            let sticky_name = self.listener.borrow().get_sticky_name().to_string();
 
             self.sticky_session = Some(StickySession::new(
                 backend
@@ -2109,7 +2113,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
             ));
 
             // stick session to listener (how? why?)
-            self.sticky_name = sticky_name.to_string();
+            self.sticky_name = sticky_name;
         }
 
         metrics.backend_id = Some(backend.borrow().backend_id.clone());
@@ -2222,15 +2226,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
 
         self.backend_readiness.interest = Ready::writable() | Ready::hup() | Ready::error();
 
-        let connect_timeout = time::Duration::seconds(i64::from(
-            proxy
-                .borrow()
-                .listeners
-                .get(&self.listener_token)
-                .as_ref()
-                .map(|listener| listener.borrow().config.connect_timeout)
-                .unwrap(),
-        ));
+        let connect_timeout =
+            time::Duration::seconds(self.listener.borrow().get_connect_timeout() as i64);
 
         self.backend_connection_status = BackendConnectionStatus::Connecting(Instant::now());
 
@@ -2306,8 +2303,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
 
             // the back timeout was of connect_timeout duration before,
             // now that we're connected, move to backend_timeout duration
-            let t = self.backend_timeout_duration;
-            self.set_backend_timeout(t);
+            // let timeout = self.backend_timeout.duration();
+            self.set_backend_timeout(self.backend_timeout.duration());
             self.cancel_backend_timeout();
 
             if let Some(backend) = &self.backend {
@@ -2373,31 +2370,13 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
             }
         }
     }
-}
 
-/*
-
-
-
-
-
-
-
-
-
-
-
-
-
-*/
-
-impl<Front: SocketHandler, L: ListenerHandler> SessionState for Http<Front, L> {
-    fn ready(
+    fn ready_inner(
         &mut self,
         session: Rc<RefCell<dyn crate::ProxySession>>,
         proxy: Rc<RefCell<Proxy>>,
         metrics: &mut SessionMetrics,
-    ) -> ProtocolResult {
+    ) -> SessionResult {
         let mut counter = 0;
         let max_loop_iterations = 100000;
 
@@ -2485,7 +2464,7 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Http<Front, L> {
                 match session_result {
                     // TODO: verify ReconnectBackend makes sense here
                     SessionResult::ConnectBackend | SessionResult::ReconnectBackend => {
-                        match self.connect_to_backend(session.clone()) {
+                        match self.connect_to_backend(session.clone(), proxy, metrics) {
                             // reuse connection or send a default answer, we can continue
                             Ok(BackendConnectAction::Reuse) => {}
                             Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
@@ -2499,7 +2478,7 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Http<Front, L> {
                     }
                     SessionResult::Continue => ProtocolResult::Continue,
                     SessionResult::CloseSession => ProtocolResult::Close,
-                    SessionResult::CloseBackend => self.close_backend(),
+                    SessionResult::CloseBackend => self.close_backend(proxy, metrics),
                 }
             }
 
@@ -2588,6 +2567,44 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Http<Front, L> {
 
         SessionResult::Continue
     }
+}
+
+/*
+
+
+
+
+
+
+
+
+
+
+
+
+
+*/
+
+impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> SessionState
+    for Http<Front, L>
+{
+    fn ready(
+        &mut self,
+        session: Rc<RefCell<dyn crate::ProxySession>>,
+        proxy: Rc<RefCell<Proxy>>,
+        metrics: &mut SessionMetrics,
+    ) -> ProtocolResult {
+        match self.ready_inner(session, proxy, metrics) {
+            SessionResult::CloseSession => ProtocolResult::Close,
+            SessionResult::CloseBackend => {
+                self.close_backend(proxy, metrics);
+                ProtocolResult::Continue
+            }
+            SessionResult::ReconnectBackend => todo!(),
+            SessionResult::Continue => todo!(),
+            SessionResult::ConnectBackend => todo!(),
+        }
+    }
 
     /// this does not process events
     ///
@@ -2599,7 +2616,7 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Http<Front, L> {
             self.frontend_readiness.event |= events;
             return;
         }
-        if self.backend_token() == Some(token) {
+        if self.backend_token == Some(token) {
             self.backend_readiness.event |= events;
         }
     }
@@ -2637,7 +2654,7 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Http<Front, L> {
             }
         } else if self.backend_token == Some(token) {
             //info!("backend timeout triggered for token {:?}", token);
-            self.backend_timeout.triggered();
+            self.configured_backend_timeout.triggered();
             match self.timeout_status() {
                 TimeoutStatus::Request => {
                     error!(

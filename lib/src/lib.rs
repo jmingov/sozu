@@ -205,10 +205,11 @@ use std::{cell::RefCell, collections::BTreeMap, fmt, net::SocketAddr, rc::Rc, st
 
 use anyhow::{bail, Context};
 use mio::{net::TcpStream, Token};
+use protocol::http::parser::Method;
 use time::{Duration, Instant};
 
 use crate::sozu_command::{
-    proxy::{LoadBalancingParams, ProxyEvent, ProxyRequest, ProxyResponse},
+    proxy::{LoadBalancingParams, ProxyEvent, ProxyRequest, ProxyResponse, Route},
     ready::Ready,
 };
 
@@ -266,6 +267,19 @@ pub trait ListenerHandler {
     fn get_tags(&self, key: &str) -> Option<&BTreeMap<String, String>>;
 
     fn set_tags(&mut self, key: String, tags: Option<BTreeMap<String, String>>);
+}
+
+pub trait HttpListenerHandler {
+    fn get_sticky_name(&self) -> &str;
+
+    fn get_connect_timeout(&self) -> u32;
+
+    fn frontend_from_request(
+        &self,
+        host: &str,
+        uri: &str,
+        method: &Method,
+    ) -> anyhow::Result<Route>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
