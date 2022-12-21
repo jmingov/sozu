@@ -29,7 +29,7 @@ use crate::{
     },
     timer::TimeoutContainer,
     util::UnwrapLog,
-    ListenerHandler, HttpListenerHandler,
+    HttpListenerHandler, ListenerHandler,
 };
 
 use super::{
@@ -39,7 +39,6 @@ use super::{
         http::{
             answers::HttpAnswers,
             parser::{hostname_and_port, Method},
-            DefaultAnswerStatus,
         },
         proxy_protocol::expect::ExpectProxyProtocol,
         {Http, Pipe, ProtocolResult},
@@ -67,20 +66,20 @@ pub enum State {
 ///
 /// 1 session <=> 1 HTTP connection (client to sozu)
 pub struct Session {
-    frontend_token: Token,
-    protocol: Option<State>,
-    proxy: Rc<RefCell<Proxy>>,
-    pool: Weak<RefCell<Pool>>,
-    metrics: SessionMetrics,
-    pub cluster_id: Option<String>,
-    sticky_name: String,
-    pub listener_token: Token,
     answers: Rc<RefCell<HttpAnswers>>,
-    last_event: Instant,
+    backend_timeout_duration: Duration,
     front_timeout: TimeoutContainer,
     frontend_timeout_duration: Duration,
-    backend_timeout_duration: Duration,
+    frontend_token: Token,
+    last_event: Instant,
     listener: Rc<RefCell<Listener>>,
+    pub listener_token: Token,
+    metrics: SessionMetrics,
+    pool: Weak<RefCell<Pool>>,
+    // TODO: rename into "state" or "state_protocol" or else
+    protocol: Option<State>,
+    proxy: Rc<RefCell<Proxy>>,
+    sticky_name: String,
 }
 
 impl Session {
@@ -137,11 +136,10 @@ impl Session {
             frontend_token: token,
             pool,
             metrics,
-            cluster_id: None,
             sticky_name,
             last_event: Instant::now(),
             front_timeout,
-            listener_token: listener_token,
+            listener_token,
             answers,
             frontend_timeout_duration,
             backend_timeout_duration,
@@ -160,7 +158,7 @@ impl Session {
             State::Http(mut http) => {
                 debug!("switching to pipe");
                 let front_token = self.frontend_token;
-                let back_token = unwrap_msg!(http.back_token());
+                let back_token = unwrap_msg!(http.backend_token);
                 let ws_context = http.websocket_context();
 
                 let front_buf = match http.frontend_buffer {
@@ -637,7 +635,9 @@ impl ProxySession for Session {
 
         match protocol_result {
             ProtocolResult::Upgrade => {
-                self.upgrade();
+                if self.upgrade() {
+                    self.ready(session);
+                }
             }
             ProtocolResult::Close => self.close(),
             ProtocolResult::Continue => {}
@@ -682,8 +682,8 @@ impl ProxySession for Session {
         };
 
         error!(
-            "zombie session[{:?} => {:?}], state => readiness: {:?} -> {:?}, protocol: {}, cluster_id: {:?}, metrics: {:?}",
-            self.frontend_token, self.back_token(), rf, rb, p, self.cluster_id, self.metrics
+            "zombie session[{:?} => {:?}], state => readiness: {:?} -> {:?}, protocol: {}, metrics: {:?}",
+            self.frontend_token, self.back_token(), rf, rb, p, self.metrics
         );
     }
 

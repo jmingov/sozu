@@ -108,14 +108,14 @@ pub struct Http<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> 
     pub backend: Option<Rc<RefCell<Backend>>>,
     pub backend_buffer: Option<BufferQueue>,
     backend_connection_status: BackendConnectionStatus,
-    configured_connect_timeout: u32,
-    configured_backend_timeout: u32,
     pub backend_id: Option<String>,
     pub backend_readiness: Readiness,
     pub backend_socket: Option<TcpStream>,
     backend_stop: Option<Instant>,
     pub backend_timeout: TimeoutContainer,
-    backend_token: Option<Token>,
+    pub backend_token: Option<Token>,
+    configured_connect_timeout: u32,
+    configured_backend_timeout: u32,
     closing: bool,
     pub cluster_id: Option<String>,
     // configured_backend_timeout: Duration,
@@ -132,7 +132,7 @@ pub struct Http<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> 
     protocol: Protocol,
     public_address: SocketAddr,
     pub request_id: Ulid,
-    request_state: Option<RequestState>,
+    pub request_state: Option<RequestState>,
     request_header_end: Option<usize>,
     response_state: Option<ResponseState>,
     response_header_end: Option<usize>,
@@ -2383,11 +2383,6 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
         if self.backend_connection_status.is_connecting()
             && !self.backend_readiness.event.is_empty()
         {
-            /*
-            if let Some(h) = self.http_mut() {
-                h.cancel_backend_timeout();
-            }
-            */
             self.cancel_backend_timeout();
 
             if self.backend_readiness.event.is_hup() && !self.test_backend_socket() {
@@ -2410,7 +2405,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                     Ok(BackendConnectAction::Reuse) => {}
                     Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
                         // we must wait for an event
-                        return ProtocolResult::Continue;
+                        return SessionResult::Continue;
                     }
                     Err(connection_error) => {
                         error!("Error connecting to backend: {:#}", connection_error)
@@ -2427,7 +2422,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
         }
 
         if self.frontend_readiness.event.is_hup() {
-            return ProtocolResult::Close;
+            return SessionResult::CloseSession;
         }
 
         let token = self.frontend_token;
@@ -2440,7 +2435,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                 self.log_context(),
                 token,
                 self.frontend_readiness,
-                self.backend_readiness,
+                self.backend_readiness
             );
 
             if frontend_interest.is_empty() && backend_interest.is_empty() {
@@ -2463,60 +2458,67 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
 
                 match session_result {
                     // TODO: verify ReconnectBackend makes sense here
-                    SessionResult::ConnectBackend | SessionResult::ReconnectBackend => {
+                    SessionResult::ConnectBackend => {
                         match self.connect_to_backend(session.clone(), proxy, metrics) {
                             // reuse connection or send a default answer, we can continue
                             Ok(BackendConnectAction::Reuse) => {}
                             Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
                                 // we must wait for an event
-                                return ProtocolResult::Continue;
+                                return SessionResult::Continue;
                             }
                             Err(connection_error) => {
                                 error!("Error connecting to backend: {:#}", connection_error)
                             }
                         }
                     }
-                    SessionResult::Continue => ProtocolResult::Continue,
-                    SessionResult::CloseSession => ProtocolResult::Close,
-                    SessionResult::CloseBackend => self.close_backend(proxy, metrics),
+                    SessionResult::Continue => {}
+                    other => return other,
                 }
             }
 
             if backend_interest.is_writable() {
-                let order = self.backend_writable(metrics);
-                if order != SessionResult::Continue {
-                    return order;
+                let session_result = self.backend_writable(metrics);
+                if session_result != SessionResult::Continue {
+                    return session_result;
                 }
             }
 
             if backend_interest.is_readable() {
-                let order = self.backend_readable(metrics);
-                if order != SessionResult::Continue {
-                    return order;
+                let (protocol_result, session_result) = self.backend_readable(metrics);
+
+                if protocol_result == ProtocolResult::Upgrade {
+                    return SessionResult::Upgrade;
+                }
+
+                if session_result != SessionResult::Continue {
+                    return session_result;
                 }
             }
 
             if frontend_interest.is_writable() {
-                let order = self.writable(metrics);
-                trace!("front writable\tinterpreting session order {:?}", order);
+                let session_result = self.writable(metrics);
+                trace!(
+                    "front writable\tinterpreting session order {:?}",
+                    session_result
+                );
 
-                if order != SessionResult::Continue {
-                    return order;
+                if session_result != SessionResult::Continue {
+                    return session_result;
                 }
             }
 
             if backend_interest.is_hup() {
-                let order = self.backend_hup();
-                match order {
+                let session_result = self.backend_hup();
+                match session_result {
                     SessionResult::CloseSession | SessionResult::CloseBackend => {
-                        return order;
+                        return session_result;
                     }
                     SessionResult::Continue => {
                         continue;
                     }
                     _ => {
                         self.backend_readiness.event.remove(Ready::hup());
-                        return order;
+                        return session_result;
                     }
                 };
             }
@@ -2548,7 +2550,10 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
         }
 
         if counter == max_loop_iterations {
-            error!("PROXY\thandling session {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection", self.frontend_token, max_loop_iterations);
+            error!(
+                "PROXY\thandling session {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection",
+                self.frontend_token, max_loop_iterations
+            );
             incr!("http.infinite_loop.error");
 
             let frontend_interest = self.frontend_readiness.filter_interest();
@@ -2600,9 +2605,10 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> SessionStat
                 self.close_backend(proxy, metrics);
                 ProtocolResult::Continue
             }
+            SessionResult::Continue => ProtocolResult::Continue,
+            SessionResult::Upgrade => ProtocolResult::Upgrade,
             SessionResult::ReconnectBackend => todo!(),
-            SessionResult::Continue => todo!(),
-            SessionResult::ConnectBackend => todo!(),
+            SessionResult::ConnectBackend => unreachable!(),
         }
     }
 
@@ -2654,7 +2660,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> SessionStat
             }
         } else if self.backend_token == Some(token) {
             //info!("backend timeout triggered for token {:?}", token);
-            self.configured_backend_timeout.triggered();
+            self.backend_timeout.triggered();
             match self.timeout_status() {
                 TimeoutStatus::Request => {
                     error!(

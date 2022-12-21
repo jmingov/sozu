@@ -409,6 +409,7 @@ pub enum SessionResult {
     ReconnectBackend,
     Continue,
     ConnectBackend,
+    Upgrade,
 }
 
 #[derive(Debug, PartialEq, Eq)]

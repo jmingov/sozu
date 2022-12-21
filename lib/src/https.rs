@@ -40,25 +40,21 @@ use crate::{
         h2::Http2,
         http::{
             answers::HttpAnswers,
-            parser::{hostname_and_port, Method, RequestState},
+            parser::{hostname_and_port, Method},
             DefaultAnswerStatus,
         },
         proxy_protocol::expect::ExpectProxyProtocol,
         rustls::TlsHandshake as RustlsHandshake,
-        Http, Pipe, ProtocolResult, StickySession,
+        Http, Pipe, ProtocolResult, SessionState,
     },
-    retry::RetryPolicy,
     router::Router,
-    server::{
-        push_event, ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken,
-        CONN_RETRIES,
-    },
+    server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken},
     socket::{server_bind, FrontRustls},
     sozu_command::{
         logging,
         proxy::{
             AddCertificate, CertificateFingerprint, Cluster, HttpFrontend, HttpsListener,
-            ProxyEvent, ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseContent,
+            ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseContent,
             ProxyResponseStatus, Query, QueryAnswer, QueryAnswerCertificate, QueryCertificateType,
             RemoveCertificate, Route, TlsVersion,
         },
@@ -72,8 +68,8 @@ use crate::{
         ParsedCertificateAndKey,
     },
     util::UnwrapLog,
-    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ListenerHandler, Protocol,
-    ProxyConfiguration, ProxySession, Readiness, SessionMetrics, SessionResult, HttpListenerHandler,
+    AcceptError, HttpListenerHandler, ListenerHandler, Protocol, ProxyConfiguration, ProxySession,
+    Readiness, SessionMetrics, SessionResult,
 };
 
 // const SERVER_PROTOS: &[&str] = &["http/1.1", "h2"];
@@ -103,25 +99,22 @@ pub enum AlpnProtocols {
 }
 
 pub struct Session {
-    pub frontend_token: Token,
-    pub backend: Option<Rc<RefCell<Backend>>>,
-    pub back_connected: BackendConnectionStatus,
-    state: State,
-    pub public_address: StdSocketAddr,
-    pool: Weak<RefCell<Pool>>,
-    proxy: Rc<RefCell<Proxy>>,
-    pub metrics: SessionMetrics,
-    pub cluster_id: Option<String>,
-    sticky_name: String,
-    last_event: Instant,
-    pub listener_token: Token,
-    pub connection_attempt: u8,
-    peer_address: Option<StdSocketAddr>,
     answers: Rc<RefCell<HttpAnswers>>,
+    backend_timeout_duration: Duration,
     front_timeout: TimeoutContainer,
     frontend_timeout_duration: Duration,
-    backend_timeout_duration: Duration,
+    pub frontend_token: Token,
+    last_event: Instant,
     pub listener: Rc<RefCell<Listener>>,
+    pub listener_token: Token,
+    pub metrics: SessionMetrics,
+    peer_address: Option<StdSocketAddr>,
+    pool: Weak<RefCell<Pool>>,
+    proxy: Rc<RefCell<Proxy>>,
+    pub public_address: StdSocketAddr,
+    // TODO: rename into "state" or "state_protocol" or else
+    protocol: State,
+    sticky_name: String,
 }
 
 impl Session {
@@ -167,18 +160,14 @@ impl Session {
         let metrics = SessionMetrics::new(Some(wait_time));
         let mut session = Session {
             frontend_token: token,
-            backend: None,
-            back_connected: BackendConnectionStatus::NotConnected,
-            state,
+            protocol: state,
             public_address,
             pool,
             proxy,
             sticky_name,
             metrics,
-            cluster_id: None,
             last_event: Instant::now(),
             listener_token,
-            connection_attempt: 0,
             peer_address,
             answers,
             front_timeout,
@@ -192,7 +181,7 @@ impl Session {
     }
 
     pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: Option<Rc<Vec<u8>>>) {
-        match &mut self.state {
+        match &mut self.protocol {
             State::Invalid => unreachable!(),
             State::Http(http) => {
                 http.set_answer(answer, buf);
@@ -204,7 +193,7 @@ impl Session {
     pub fn upgrade(&mut self) -> bool {
         // We swap an Invalid state to take ownership over the current state
         let mut owned_state = State::Invalid;
-        std::mem::swap(&mut owned_state, &mut self.state);
+        std::mem::swap(&mut owned_state, &mut self.protocol);
         let new_state = match owned_state {
             State::Invalid => unreachable!(),
             State::Expect(expect, ssl) => self.upgrade_expect(expect, ssl),
@@ -216,7 +205,7 @@ impl Session {
 
         match new_state {
             Some(state) => {
-                self.state = state;
+                self.protocol = state;
                 true
             }
             None => {
@@ -305,23 +294,29 @@ impl Session {
         match alpn {
             AlpnProtocols::Http11 => {
                 let mut http = Http::new(
+                    self.answers.clone(),
+                    self.listener.borrow().config.back_timeout,
+                    self.listener.borrow().config.connect_timeout,
                     front_stream,
+                    self.frontend_timeout_duration,
+                    self.front_timeout.take(),
+                    // self.backend_timeout_duration,
                     self.frontend_token,
-                    handshake.request_id,
+                    self.listener.clone(),
                     self.pool.clone(),
+                    Protocol::HTTPS,
                     self.public_address,
+                    handshake.request_id,
                     self.peer_address,
                     self.sticky_name.clone(),
-                    Protocol::HTTPS,
-                    self.answers.clone(),
-                    self.front_timeout.take(),
-                    self.frontend_timeout_duration,
-                    self.backend_timeout_duration,
-                    self.listener.clone(),
                 );
 
-                let res = http.frontend.session.reader().read(front_buf.space());
-                match res {
+                match http
+                    .frontend_socket
+                    .session
+                    .reader()
+                    .read(front_buf.space())
+                {
                     Ok(sz) => {
                         //info!("rustls upgrade: there were {} bytes of plaintext available", sz);
                         front_buf.fill(sz);
@@ -333,13 +328,14 @@ impl Session {
                     }
                 }
 
-                let sz = front_buf.available_data();
+                let size = front_buf.available_data();
                 let mut buf = BufferQueue::with_buffer(front_buf);
-                buf.sliced_input(sz);
+                buf.sliced_input(size);
 
-                http.front_buf = Some(buf);
-                http.front_readiness = readiness;
-                http.front_readiness.interest = Ready::readable() | Ready::hup() | Ready::error();
+                http.frontend_buffer = Some(buf);
+                http.frontend_readiness = readiness;
+                http.frontend_readiness.interest =
+                    Ready::readable() | Ready::hup() | Ready::error();
 
                 gauge_add!("protocol.https", 1);
                 Some(State::Http(http))
@@ -370,7 +366,7 @@ impl Session {
         let back_token = unwrap_msg!(http.backend_token);
         let ws_context = http.websocket_context();
 
-        let front_buf = match http.front_buf {
+        let front_buf = match http.frontend_buffer {
             Some(buf) => buf.buffer,
             None => {
                 let pool = match self.pool.upgrade() {
@@ -385,7 +381,7 @@ impl Session {
                 buffer
             }
         };
-        let back_buf = match http.back_buf {
+        let back_buf = match http.backend_buffer {
             Some(buf) => buf.buffer,
             None => {
                 let pool = match self.pool.upgrade() {
@@ -402,13 +398,13 @@ impl Session {
         };
 
         let mut pipe = Pipe::new(
-            http.frontend,
+            http.frontend_socket,
             front_token,
             http.request_id,
             http.cluster_id,
             http.backend_id,
             Some(ws_context),
-            http.backend,
+            http.backend_socket,
             front_buf,
             back_buf,
             http.session_address,
@@ -416,16 +412,16 @@ impl Session {
             self.listener.clone(),
         );
 
-        pipe.front_readiness.event = http.front_readiness.event;
-        pipe.back_readiness.event = http.back_readiness.event;
-        http.front_timeout
+        pipe.front_readiness.event = http.frontend_readiness.event;
+        pipe.back_readiness.event = http.backend_readiness.event;
+        http.frontend_timeout
             .set_duration(self.frontend_timeout_duration);
-        http.back_timeout
+        http.backend_timeout
             .set_duration(self.backend_timeout_duration);
-        pipe.front_timeout = Some(http.front_timeout);
-        pipe.back_timeout = Some(http.back_timeout);
+        pipe.front_timeout = Some(http.frontend_timeout);
+        pipe.back_timeout = Some(http.backend_timeout);
         pipe.set_back_token(back_token);
-        pipe.set_cluster_id(self.cluster_id.clone());
+        pipe.set_cluster_id(http.cluster_id.clone());
 
         gauge_add!("protocol.https", -1);
         gauge_add!("protocol.wss", 1);
@@ -444,13 +440,14 @@ impl Session {
         Some(State::WebSocket(websocket))
     }
 
+    /*
     fn front_hup(&mut self) -> SessionResult {
         match &mut self.state {
             State::Invalid => unreachable!(),
-            State::Http(http) => http.front_hup(),
+            State::Http(_) | State::Handshake(_) | State::Expect(_, _) => {
+                SessionResult::CloseSession
+            }
             State::WebSocket(pipe) => pipe.front_hup(&mut self.metrics),
-            State::Handshake(_) => SessionResult::CloseSession,
-            State::Expect(_, _) => SessionResult::CloseSession,
             State::Http2(_) => todo!(),
         }
     }
@@ -458,7 +455,7 @@ impl Session {
     fn back_hup(&mut self) -> SessionResult {
         match &mut self.state {
             State::Invalid => unreachable!(),
-            State::Http(http) => http.back_hup(),
+            State::Http(http) => http.backend_hup(),
             State::WebSocket(pipe) => pipe.back_hup(&mut self.metrics),
             State::Handshake(_) => {
                 error!("why a backend HUP event while still in frontend handshake?");
@@ -471,113 +468,115 @@ impl Session {
             State::Http2(_) => todo!(),
         }
     }
+    */
 
     fn log_context(&self) -> String {
-        match &self.state {
+        match &self.protocol {
             State::Invalid => unreachable!(),
             State::Http(http) => http.log_context().to_string(),
             _ => "".to_string(),
         }
     }
 
-    fn readable(&mut self) -> SessionResult {
-        let (upgrade, session_result) = match &mut self.state {
-            State::Invalid => unreachable!(),
-            State::Expect(expect, _) => {
-                if !self.front_timeout.reset() {
-                    error!("could not reset front timeout");
+    /*
+            fn readable(&mut self) -> SessionResult {
+                let (upgrade, session_result) = match &mut self.state {
+                    State::Invalid => unreachable!(),
+                    State::Expect(expect, _) => {
+                        if !self.front_timeout.reset() {
+                            error!("could not reset front timeout");
+                        }
+                        expect.readable(&mut self.metrics)
+                    }
+                    State::Handshake(handshake) => {
+                        if !self.front_timeout.reset() {
+                            error!("could not reset front timeout");
+                        }
+                        handshake.readable()
+                    }
+                    State::Http(http) => (ProtocolResult::Continue, http.readable(&mut self.metrics)),
+                    State::WebSocket(pipe) => (ProtocolResult::Continue, pipe.readable(&mut self.metrics)),
+                    State::Http2(_) => todo!(),
+                };
+
+                if upgrade == ProtocolResult::Continue {
+                    session_result
+                } else if self.upgrade() {
+                    match &mut self.state {
+                        State::Invalid => unreachable!(),
+                        State::Http(http) => http.readable(&mut self.metrics),
+                        State::Http2(_) => todo!(),
+                        _ => session_result,
+                    }
+                } else {
+                    SessionResult::CloseSession
                 }
-                expect.readable(&mut self.metrics)
             }
-            State::Handshake(handshake) => {
-                if !self.front_timeout.reset() {
-                    error!("could not reset front timeout");
+
+            fn writable(&mut self) -> SessionResult {
+                let (upgrade, session_result) = match self.state {
+                    State::Invalid => unreachable!(),
+                    State::Expect(_, _) => return SessionResult::CloseSession,
+                    State::Handshake(ref mut handshake) => handshake.writable(),
+                    State::Http(ref mut http) => {
+                        (ProtocolResult::Continue, http.writable(&mut self.metrics))
+                    }
+                    State::WebSocket(ref mut pipe) => {
+                        (ProtocolResult::Continue, pipe.writable(&mut self.metrics))
+                    }
+                    State::Http2(_) => todo!(),
+                };
+
+                if upgrade == ProtocolResult::Continue {
+                    return session_result;
                 }
-                handshake.readable()
+                if self.upgrade() {
+                    if (self.front_readiness().event & self.front_readiness().interest).is_writable() {
+                        return self.writable();
+                    }
+                    return SessionResult::Continue;
+                }
+                SessionResult::CloseSession
             }
-            State::Http(http) => (ProtocolResult::Continue, http.readable(&mut self.metrics)),
-            State::WebSocket(pipe) => (ProtocolResult::Continue, pipe.readable(&mut self.metrics)),
-            State::Http2(_) => todo!(),
-        };
 
-        if upgrade == ProtocolResult::Continue {
-            session_result
-        } else if self.upgrade() {
-            match &mut self.state {
-                State::Invalid => unreachable!(),
-                State::Http(http) => http.readable(&mut self.metrics),
-                State::Http2(_) => todo!(),
-                _ => session_result,
+            fn back_readable(&mut self) -> SessionResult {
+                let (upgrade, session_result) = match self.state {
+                    State::Invalid => unreachable!(),
+                    State::Expect(_, _) => return SessionResult::CloseSession,
+                    State::Http(ref mut http) => http.backend_readable(&mut self.metrics),
+                    State::Handshake(_) => (ProtocolResult::Continue, SessionResult::CloseSession),
+                    State::WebSocket(ref mut pipe) => (
+                        ProtocolResult::Continue,
+                        pipe.back_readable(&mut self.metrics),
+                    ),
+                    State::Http2(_) => todo!(),
+                };
+
+                if upgrade == ProtocolResult::Continue {
+                    return session_result;
+                }
+                if !self.upgrade() {
+                    return SessionResult::CloseSession;
+                }
+                match self.state {
+                    State::Invalid => unreachable!(),
+                    State::WebSocket(ref mut pipe) => pipe.back_readable(&mut self.metrics),
+                    _ => session_result,
+                }
             }
-        } else {
-            SessionResult::CloseSession
-        }
-    }
 
-    fn writable(&mut self) -> SessionResult {
-        let (upgrade, session_result) = match self.state {
-            State::Invalid => unreachable!(),
-            State::Expect(_, _) => return SessionResult::CloseSession,
-            State::Handshake(ref mut handshake) => handshake.writable(),
-            State::Http(ref mut http) => {
-                (ProtocolResult::Continue, http.writable(&mut self.metrics))
+            fn back_writable(&mut self) -> SessionResult {
+                match self.state {
+                    State::Invalid => unreachable!(),
+                    State::Expect(_, _) | State::Handshake(_) => SessionResult::CloseSession,
+                    State::Http(ref mut http) => http.backend_writable(&mut self.metrics),
+                    State::WebSocket(ref mut pipe) => pipe.back_writable(&mut self.metrics),
+                    State::Http2(_) => todo!(),
+                }
             }
-            State::WebSocket(ref mut pipe) => {
-                (ProtocolResult::Continue, pipe.writable(&mut self.metrics))
-            }
-            State::Http2(_) => todo!(),
-        };
-
-        if upgrade == ProtocolResult::Continue {
-            return session_result;
-        }
-        if self.upgrade() {
-            if (self.front_readiness().event & self.front_readiness().interest).is_writable() {
-                return self.writable();
-            }
-            return SessionResult::Continue;
-        }
-        SessionResult::CloseSession
-    }
-
-    fn back_readable(&mut self) -> SessionResult {
-        let (upgrade, session_result) = match self.state {
-            State::Invalid => unreachable!(),
-            State::Expect(_, _) => return SessionResult::CloseSession,
-            State::Http(ref mut http) => http.back_readable(&mut self.metrics),
-            State::Handshake(_) => (ProtocolResult::Continue, SessionResult::CloseSession),
-            State::WebSocket(ref mut pipe) => (
-                ProtocolResult::Continue,
-                pipe.back_readable(&mut self.metrics),
-            ),
-            State::Http2(_) => todo!(),
-        };
-
-        if upgrade == ProtocolResult::Continue {
-            return session_result;
-        }
-        if !self.upgrade() {
-            return SessionResult::CloseSession;
-        }
-        match self.state {
-            State::Invalid => unreachable!(),
-            State::WebSocket(ref mut pipe) => pipe.back_readable(&mut self.metrics),
-            _ => session_result,
-        }
-    }
-
-    fn back_writable(&mut self) -> SessionResult {
-        match self.state {
-            State::Invalid => unreachable!(),
-            State::Expect(_, _) | State::Handshake(_) => SessionResult::CloseSession,
-            State::Http(ref mut http) => http.back_writable(&mut self.metrics),
-            State::WebSocket(ref mut pipe) => pipe.back_writable(&mut self.metrics),
-            State::Http2(_) => todo!(),
-        }
-    }
-
+    */
     fn front_socket(&self) -> Option<&MioTcpStream> {
-        match &self.state {
+        match &self.protocol {
             State::Invalid => unreachable!(),
             State::Expect(expect, _) => Some(expect.front_socket()),
             State::Handshake(handshake) => Some(&handshake.stream),
@@ -587,19 +586,21 @@ impl Session {
         }
     }
 
+    /*
     fn back_socket(&self) -> Option<&MioTcpStream> {
         match self.state {
             State::Invalid => unreachable!(),
             State::Expect(_, _) => None,
             State::Handshake(_) => None,
-            State::Http(ref http) => http.back_socket(),
+            State::Http(ref http) => http.backend_socket(),
             State::WebSocket(ref pipe) => pipe.back_socket(),
             State::Http2(_) => todo!(),
         }
     }
+    */
 
     fn back_token(&self) -> Vec<Token> {
-        match self.state {
+        match self.protocol {
             State::Invalid => unreachable!(),
             State::Expect(_, _) => vec![],
             State::Handshake(_) => vec![],
@@ -608,6 +609,7 @@ impl Session {
             State::Http2(_) => todo!(),
         }
     }
+    /*
 
     fn set_back_socket(&mut self, sock: MioTcpStream) {
         let backend = self.backend.clone();
@@ -710,26 +712,29 @@ impl Session {
         }
     }
 
+    */
     fn front_readiness(&mut self) -> &mut Readiness {
-        match self.state {
+        match self.protocol {
             State::Invalid => unreachable!(),
             State::Expect(ref mut expect, _) => &mut expect.readiness,
             State::Handshake(ref mut handshake) => &mut handshake.readiness,
-            State::Http(ref mut http) => http.front_readiness(),
+            State::Http(ref mut http) => http.frontend_readiness(),
             State::WebSocket(ref mut pipe) => &mut pipe.front_readiness,
             State::Http2(_) => todo!(),
         }
     }
 
     fn back_readiness(&mut self) -> Option<&mut Readiness> {
-        match self.state {
+        match self.protocol {
             State::Invalid => unreachable!(),
-            State::Http(ref mut http) => Some(http.back_readiness()),
+            State::Http(ref mut http) => Some(http.backend_readiness()),
             State::Http2(_) => todo!(),
             State::WebSocket(ref mut pipe) => Some(&mut pipe.back_readiness),
             _ => None,
         }
     }
+
+    /*
 
     fn fail_backend_connection(&mut self) {
         self.backend.as_ref().map(|backend| {
@@ -765,11 +770,12 @@ impl Session {
     fn reset_connection_attempt(&mut self) {
         self.connection_attempt = 0;
     }
+    */
 
     fn cancel_timeouts(&mut self) {
         self.front_timeout.cancel();
 
-        match self.state {
+        match self.protocol {
             State::Invalid => unreachable!(),
             State::Http(ref mut http) => http.cancel_timeouts(),
             State::WebSocket(ref mut pipe) => pipe.cancel_timeouts(),
@@ -777,368 +783,370 @@ impl Session {
         }
     }
 
-    fn cancel_backend_timeout(&mut self) {
-        match self.state {
-            State::Invalid => unreachable!(),
-            State::Http(ref mut http) => http.cancel_backend_timeout(),
-            _ => {}
-        }
-    }
-
-    fn ready_inner(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionResult {
-        let mut counter = 0;
-        let max_loop_iterations = 100000;
-
-        if self.back_connected().is_connecting()
-            && self
-                .back_readiness()
-                .map(|r| r.event != Ready::empty())
-                .unwrap_or(false)
-        {
-            self.cancel_backend_timeout();
-
-            let back_is_hup = self
-                .back_readiness()
-                .map(|r| r.event.is_hup())
-                .unwrap_or(false);
-            let back_is_alive = match self.state {
-                State::Invalid => unreachable!(),
-                State::Http(ref mut http) => http.test_back_socket(),
-                _ => false,
-            };
-            if back_is_hup && !back_is_alive {
-                //retry connecting the backend
-                error!(
-                    "{} error connecting to backend, trying again",
-                    self.log_context()
-                );
-                self.connection_attempt += 1;
-                self.fail_backend_connection();
-
-                self.back_connected = BackendConnectionStatus::Connecting(Instant::now());
-
-                // trigger a backend reconnection
-                self.close_backend();
-                match self.connect_to_backend(session.clone()) {
-                    // reuse connection or send a default answer, we can continue
-                    Ok(BackendConnectAction::Reuse) => {}
-                    Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
-                        // stop here, we must wait for an event
-                        return SessionResult::Continue;
-                    }
-                    Err(connection_error) => {
-                        error!("Error connecting to backend: {:#}", connection_error)
-                    }
-                }
-            } else {
-                self.metrics().backend_connected();
-                self.reset_connection_attempt();
-                self.set_back_connected(BackendConnectionStatus::Connected);
-            }
-        }
-
-        if self.front_readiness().event.is_hup() {
-            let order = self.front_hup();
-            match order {
-                SessionResult::CloseSession => {
-                    return order;
-                }
-                _ => {
-                    self.front_readiness().event.remove(Ready::hup());
-                    return order;
-                }
-            }
-        }
-
-        let token = self.frontend_token;
-        while counter < max_loop_iterations {
-            let front_interest = self.front_readiness().interest & self.front_readiness().event;
-            let back_interest = self
-                .back_readiness()
-                .map(|r| r.interest & r.event)
-                .unwrap_or(Ready::empty());
-
-            trace!(
-                "PROXY\t{} {:?} {:?} -> {:?}",
-                self.log_context(),
-                token,
-                self.front_readiness().clone(),
-                self.back_readiness()
-            );
-
-            if front_interest == Ready::empty() && back_interest == Ready::empty() {
-                break;
-            }
-
-            if self
-                .back_readiness()
-                .map(|r| r.event.is_hup())
-                .unwrap_or(false)
-                && self.front_readiness().interest.is_writable()
-                && !self.front_readiness().event.is_writable()
-            {
-                break;
-            }
-
-            if front_interest.is_readable() {
-                let session_result = self.readable();
-                trace!(
-                    "front readable\tinterpreting session order {:?}",
-                    session_result
-                );
-
-                match session_result {
-                    SessionResult::ConnectBackend => {
-                        match self.connect_to_backend(session.clone()) {
-                            // reuse connection or send a default answer, we can continue
-                            Ok(BackendConnectAction::Reuse) => {}
-                            Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
-                                // we must wait for an event
-                                return SessionResult::Continue;
-                            }
-                            Err(connection_error) => {
-                                error!("Error connecting to backend: {:#}", connection_error)
-                            }
-                        }
-                    }
-                    SessionResult::Continue => {}
-                    order => return order,
-                }
-            }
-
-            if back_interest.is_writable() {
-                let order = self.back_writable();
-                if order != SessionResult::Continue {
-                    return order;
-                }
-            }
-
-            if back_interest.is_readable() {
-                let order = self.back_readable();
-                if order != SessionResult::Continue {
-                    return order;
-                }
-            }
-
-            if front_interest.is_writable() {
-                let order = self.writable();
-                trace!("front writable\tinterpreting session order {:?}", order);
-                if order != SessionResult::Continue {
-                    return order;
-                }
-            }
-
-            if back_interest.is_hup() {
-                let order = self.back_hup();
-                match order {
-                    SessionResult::CloseSession | SessionResult::CloseBackend => {
-                        return order;
-                    }
-                    SessionResult::Continue => {
-                        // FIXME: do we have to fix something?
-                        /*self.front_readiness().interest.insert(Ready::writable());
-                        if ! self.front_readiness().event.is_writable() {
-                          error!("got back socket HUP but there's still data, and front is not writable yet(HTTPS)[{:?} => {:?}]", self.frontend_token, self.back_token());
-                          break;
-                        }*/
-                    }
-                    _ => {
-                        if let Some(r) = self.back_readiness() {
-                            r.event.remove(Ready::hup())
-                        }
-                        return order;
-                    }
-                };
-            }
-
-            if front_interest.is_error() {
-                error!(
-                    "PROXY session {:?} front error, disconnecting",
-                    self.frontend_token
-                );
-                self.front_readiness().interest = Ready::empty();
-                self.back_readiness().map(|r| r.interest = Ready::empty());
-                return SessionResult::CloseSession;
-            }
-
-            if back_interest.is_error() && self.back_hup() == SessionResult::CloseSession {
-                self.front_readiness().interest = Ready::empty();
-                self.back_readiness().map(|r| r.interest = Ready::empty());
-                error!(
-                    "PROXY session {:?} back error, disconnecting",
-                    self.frontend_token
-                );
-                return SessionResult::CloseSession;
-            }
-
-            counter += 1;
-        }
-
-        if counter == max_loop_iterations {
-            error!("PROXY\thandling session {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection", self.frontend_token, max_loop_iterations);
-            incr!("https.infinite_loop.error");
-
-            let front_interest = self.front_readiness().filter_interest();
-            let back_interest = self.back_readiness().map(|r| r.interest & r.event);
-
-            let token = self.frontend_token;
-            let back = self.back_readiness().cloned();
-            error!(
-                "PROXY\t{:?} readiness: {:?} -> {:?} | front: {:?} | back: {:?} ",
-                token,
-                self.front_readiness(),
-                back,
-                front_interest,
-                back_interest
-            );
-            self.print_state();
-
-            return SessionResult::CloseSession;
-        }
-
-        SessionResult::Continue
-    }
-
-    fn close_backend(&mut self) {
-        if let Some(token) = self.back_token() {
-            if let Some(fd) = self.back_socket().map(|stream| stream.as_raw_fd()) {
-                let proxy = self.proxy.borrow();
-                if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
-                    error!("1error deregistering socket({:?}): {:?}", fd, e);
-                }
-
-                proxy.sessions.borrow_mut().slab.try_remove(token.0);
-            }
-
-            self.remove_backend();
-
-            let back_connected = self.back_connected();
-            if back_connected != BackendConnectionStatus::NotConnected {
-                self.back_readiness().map(|r| r.event = Ready::empty());
-                if let Some(sock) = self.back_socket() {
-                    if let Err(e) = sock.shutdown(Shutdown::Both) {
-                        if e.kind() != ErrorKind::NotConnected {
-                            error!("error closing back socket({:?}): {:?}", sock, e);
-                        }
-                    }
-                }
-            }
-
-            if back_connected == BackendConnectionStatus::Connected {
-                gauge_add!("backend.connections", -1);
-                gauge_add!(
-                    "connections_per_backend",
-                    -1,
-                    self.cluster_id.as_deref(),
-                    self.metrics.backend_id.as_deref()
-                );
-            }
-
-            self.set_back_connected(BackendConnectionStatus::NotConnected);
-
+    /*
+        fn cancel_backend_timeout(&mut self) {
             match self.state {
                 State::Invalid => unreachable!(),
-                State::Http(ref mut http) => {
-                    http.clear_back_token();
-                    http.remove_backend();
-                }
+                State::Http(ref mut http) => http.cancel_backend_timeout(),
                 _ => {}
             }
         }
-    }
 
-    fn check_circuit_breaker(&mut self) -> anyhow::Result<()> {
-        if self.connection_attempt >= CONN_RETRIES {
-            error!("{} max connection attempt reached", self.log_context());
-            self.set_answer(DefaultAnswerStatus::Answer503, None);
-            bail!("Maximum connection attempt reached");
+        fn ready_inner(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionResult {
+            let mut counter = 0;
+            let max_loop_iterations = 100000;
+
+            if self.back_connected().is_connecting()
+                && self
+                    .back_readiness()
+                    .map(|r| r.event != Ready::empty())
+                    .unwrap_or(false)
+            {
+                self.cancel_backend_timeout();
+
+                let back_is_hup = self
+                    .back_readiness()
+                    .map(|r| r.event.is_hup())
+                    .unwrap_or(false);
+                let back_is_alive = match self.state {
+                    State::Invalid => unreachable!(),
+                    State::Http(ref mut http) => http.test_back_socket(),
+                    _ => false,
+                };
+                if back_is_hup && !back_is_alive {
+                    //retry connecting the backend
+                    error!(
+                        "{} error connecting to backend, trying again",
+                        self.log_context()
+                    );
+                    self.connection_attempt += 1;
+                    self.fail_backend_connection();
+
+                    self.back_connected = BackendConnectionStatus::Connecting(Instant::now());
+
+                    // trigger a backend reconnection
+                    self.close_backend();
+                    match self.connect_to_backend(session.clone()) {
+                        // reuse connection or send a default answer, we can continue
+                        Ok(BackendConnectAction::Reuse) => {}
+                        Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
+                            // stop here, we must wait for an event
+                            return SessionResult::Continue;
+                        }
+                        Err(connection_error) => {
+                            error!("Error connecting to backend: {:#}", connection_error)
+                        }
+                    }
+                } else {
+                    self.metrics().backend_connected();
+                    self.reset_connection_attempt();
+                    self.set_back_connected(BackendConnectionStatus::Connected);
+                }
+            }
+
+            if self.front_readiness().event.is_hup() {
+                let order = self.front_hup();
+                match order {
+                    SessionResult::CloseSession => {
+                        return order;
+                    }
+                    _ => {
+                        self.front_readiness().event.remove(Ready::hup());
+                        return order;
+                    }
+                }
+            }
+
+            let token = self.frontend_token;
+            while counter < max_loop_iterations {
+                let front_interest = self.front_readiness().interest & self.front_readiness().event;
+                let back_interest = self
+                    .back_readiness()
+                    .map(|r| r.interest & r.event)
+                    .unwrap_or(Ready::empty());
+
+                trace!(
+                    "PROXY\t{} {:?} {:?} -> {:?}",
+                    self.log_context(),
+                    token,
+                    self.front_readiness().clone(),
+                    self.back_readiness()
+                );
+
+                if front_interest == Ready::empty() && back_interest == Ready::empty() {
+                    break;
+                }
+
+                if self
+                    .back_readiness()
+                    .map(|r| r.event.is_hup())
+                    .unwrap_or(false)
+                    && self.front_readiness().interest.is_writable()
+                    && !self.front_readiness().event.is_writable()
+                {
+                    break;
+                }
+
+                if front_interest.is_readable() {
+                    let session_result = self.readable();
+                    trace!(
+                        "front readable\tinterpreting session order {:?}",
+                        session_result
+                    );
+
+                    match session_result {
+                        SessionResult::ConnectBackend => {
+                            match self.connect_to_backend(session.clone()) {
+                                // reuse connection or send a default answer, we can continue
+                                Ok(BackendConnectAction::Reuse) => {}
+                                Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
+                                    // we must wait for an event
+                                    return SessionResult::Continue;
+                                }
+                                Err(connection_error) => {
+                                    error!("Error connecting to backend: {:#}", connection_error)
+                                }
+                            }
+                        }
+                        SessionResult::Continue => {}
+                        order => return order,
+                    }
+                }
+
+                if back_interest.is_writable() {
+                    let order = self.back_writable();
+                    if order != SessionResult::Continue {
+                        return order;
+                    }
+                }
+
+                if back_interest.is_readable() {
+                    let order = self.back_readable();
+                    if order != SessionResult::Continue {
+                        return order;
+                    }
+                }
+
+                if front_interest.is_writable() {
+                    let order = self.writable();
+                    trace!("front writable\tinterpreting session order {:?}", order);
+                    if order != SessionResult::Continue {
+                        return order;
+                    }
+                }
+
+                if back_interest.is_hup() {
+                    let order = self.back_hup();
+                    match order {
+                        SessionResult::CloseSession | SessionResult::CloseBackend => {
+                            return order;
+                        }
+                        SessionResult::Continue => {
+                            // FIXME: do we have to fix something?
+                            /*self.front_readiness().interest.insert(Ready::writable());
+                            if ! self.front_readiness().event.is_writable() {
+                              error!("got back socket HUP but there's still data, and front is not writable yet(HTTPS)[{:?} => {:?}]", self.frontend_token, self.back_token());
+                              break;
+                            }*/
+                        }
+                        _ => {
+                            if let Some(r) = self.back_readiness() {
+                                r.event.remove(Ready::hup())
+                            }
+                            return order;
+                        }
+                    };
+                }
+
+                if front_interest.is_error() {
+                    error!(
+                        "PROXY session {:?} front error, disconnecting",
+                        self.frontend_token
+                    );
+                    self.front_readiness().interest = Ready::empty();
+                    self.back_readiness().map(|r| r.interest = Ready::empty());
+                    return SessionResult::CloseSession;
+                }
+
+                if back_interest.is_error() && self.back_hup() == SessionResult::CloseSession {
+                    self.front_readiness().interest = Ready::empty();
+                    self.back_readiness().map(|r| r.interest = Ready::empty());
+                    error!(
+                        "PROXY session {:?} back error, disconnecting",
+                        self.frontend_token
+                    );
+                    return SessionResult::CloseSession;
+                }
+
+                counter += 1;
+            }
+
+            if counter == max_loop_iterations {
+                error!("PROXY\thandling session {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection", self.frontend_token, max_loop_iterations);
+                incr!("https.infinite_loop.error");
+
+                let front_interest = self.front_readiness().filter_interest();
+                let back_interest = self.back_readiness().map(|r| r.interest & r.event);
+
+                let token = self.frontend_token;
+                let back = self.back_readiness().cloned();
+                error!(
+                    "PROXY\t{:?} readiness: {:?} -> {:?} | front: {:?} | back: {:?} ",
+                    token,
+                    self.front_readiness(),
+                    back,
+                    front_interest,
+                    back_interest
+                );
+                self.print_state();
+
+                return SessionResult::CloseSession;
+            }
+
+            SessionResult::Continue
         }
-        Ok(())
-    }
 
-    fn check_backend_connection(&mut self) -> bool {
-        let is_valid_backend_socket = match self.state {
-            State::Invalid => unreachable!(),
-            State::Http(ref http) => http.is_valid_backend_socket(),
-            _ => false,
-        };
+        fn close_backend(&mut self) {
+            if let Some(token) = self.back_token() {
+                if let Some(fd) = self.back_socket().map(|stream| stream.as_raw_fd()) {
+                    let proxy = self.proxy.borrow();
+                    if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
+                        error!("1error deregistering socket({:?}): {:?}", fd, e);
+                    }
 
-        if is_valid_backend_socket {
-            //matched on keepalive
-            self.metrics.backend_id = self.backend.as_ref().map(|i| i.borrow().backend_id.clone());
-            self.metrics.backend_start();
+                    proxy.sessions.borrow_mut().slab.try_remove(token.0);
+                }
 
-            let backend = match self.state {
+                self.remove_backend();
+
+                let back_connected = self.back_connected();
+                if back_connected != BackendConnectionStatus::NotConnected {
+                    self.back_readiness().map(|r| r.event = Ready::empty());
+                    if let Some(sock) = self.back_socket() {
+                        if let Err(e) = sock.shutdown(Shutdown::Both) {
+                            if e.kind() != ErrorKind::NotConnected {
+                                error!("error closing back socket({:?}): {:?}", sock, e);
+                            }
+                        }
+                    }
+                }
+
+                if back_connected == BackendConnectionStatus::Connected {
+                    gauge_add!("backend.connections", -1);
+                    gauge_add!(
+                        "connections_per_backend",
+                        -1,
+                        self.cluster_id.as_deref(),
+                        self.metrics.backend_id.as_deref()
+                    );
+                }
+
+                self.set_back_connected(BackendConnectionStatus::NotConnected);
+
+                match self.state {
+                    State::Invalid => unreachable!(),
+                    State::Http(ref mut http) => {
+                        http.clear_back_token();
+                        http.remove_backend();
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        fn check_circuit_breaker(&mut self) -> anyhow::Result<()> {
+            if self.connection_attempt >= CONN_RETRIES {
+                error!("{} max connection attempt reached", self.log_context());
+                self.set_answer(DefaultAnswerStatus::Answer503, None);
+                bail!("Maximum connection attempt reached");
+            }
+            Ok(())
+        }
+
+        fn check_backend_connection(&mut self) -> bool {
+            let is_valid_backend_socket = match self.state {
                 State::Invalid => unreachable!(),
-                State::Http(ref mut http) => http.backend_data.as_mut(),
+                State::Http(ref http) => http.is_valid_backend_socket(),
+                _ => false,
+            };
+
+            if is_valid_backend_socket {
+                //matched on keepalive
+                self.metrics.backend_id = self.backend.as_ref().map(|i| i.borrow().backend_id.clone());
+                self.metrics.backend_start();
+
+                let backend = match self.state {
+                    State::Invalid => unreachable!(),
+                    State::Http(ref mut http) => http.backend_data.as_mut(),
+                    _ => None,
+                };
+                backend.map(|backend| backend.borrow_mut().active_requests += 1);
+                return true;
+            }
+            false
+        }
+
+        pub fn extract_route(&self) -> anyhow::Result<(&str, &str, &Method)> {
+            let request_state = match self.state {
+                State::Invalid => unreachable!(),
+                State::Http(ref http) => http.request_state.as_ref(),
                 _ => None,
             };
-            backend.map(|backend| backend.borrow_mut().active_requests += 1);
-            return true;
-        }
-        false
-    }
 
-    pub fn extract_route(&self) -> anyhow::Result<(&str, &str, &Method)> {
-        let request_state = match self.state {
-            State::Invalid => unreachable!(),
-            State::Http(ref http) => http.request_state.as_ref(),
-            _ => None,
-        };
+            let given_host = request_state
+                .and_then(|request_state| request_state.get_host())
+                .with_context(|| "No host given")?;
 
-        let given_host = request_state
-            .and_then(|request_state| request_state.get_host())
-            .with_context(|| "No host given")?;
+            let (remaining_input, (hostname, port)) = match hostname_and_port(given_host.as_bytes()) {
+                Ok(tuple) => tuple,
+                Err(parse_error) => {
+                    bail!(
+                        "Hostname parsing failed for host {}: {}",
+                        given_host.clone(),
+                        parse_error,
+                    );
+                }
+            };
 
-        let (remaining_input, (hostname, port)) = match hostname_and_port(given_host.as_bytes()) {
-            Ok(tuple) => tuple,
-            Err(parse_error) => {
-                bail!(
-                    "Hostname parsing failed for host {}: {}",
-                    given_host.clone(),
-                    parse_error,
-                );
+            if remaining_input != &b""[..] {
+                bail!("invalid remaining chars after hostname {}", given_host);
             }
-        };
 
-        if remaining_input != &b""[..] {
-            bail!("invalid remaining chars after hostname {}", given_host);
+            let hostname = unsafe { from_utf8_unchecked(hostname) };
+
+            //FIXME: what if we don't use SNI?
+            let servername = match self.state {
+                State::Invalid => unreachable!(),
+                State::Http(ref http) => http.frontend.session.sni_hostname(),
+                _ => None,
+            };
+            let servername = servername.map(|name| name.to_string());
+
+            if servername.as_deref() != Some(hostname) {
+                error!(
+                    "TLS SNI hostname '{:?}' and Host header '{}' don't match",
+                    servername, hostname
+                );
+                /*FIXME: deactivate this check for a temporary test
+                unwrap_msg!(session.http()).set_answer(DefaultAnswerStatus::Answer404, None);
+                */
+                bail!("Host not found: {}", hostname);
+            }
+
+            let host = if port == Some(&b"443"[..]) {
+                hostname
+            } else {
+                given_host
+            };
+
+            let request_line = request_state
+                .as_ref()
+                .and_then(|r| r.get_request_line())
+                .with_context(|| "No request line given in the request state")?;
+
+            Ok((host, &request_line.uri, &request_line.method))
         }
 
-        let hostname = unsafe { from_utf8_unchecked(hostname) };
-
-        //FIXME: what if we don't use SNI?
-        let servername = match self.state {
-            State::Invalid => unreachable!(),
-            State::Http(ref http) => http.frontend.session.sni_hostname(),
-            _ => None,
-        };
-        let servername = servername.map(|name| name.to_string());
-
-        if servername.as_deref() != Some(hostname) {
-            error!(
-                "TLS SNI hostname '{:?}' and Host header '{}' don't match",
-                servername, hostname
-            );
-            /*FIXME: deactivate this check for a temporary test
-            unwrap_msg!(session.http()).set_answer(DefaultAnswerStatus::Answer404, None);
-            */
-            bail!("Host not found: {}", hostname);
-        }
-
-        let host = if port == Some(&b"443"[..]) {
-            hostname
-        } else {
-            given_host
-        };
-
-        let request_line = request_state
-            .as_ref()
-            .and_then(|r| r.get_request_line())
-            .with_context(|| "No request line given in the request state")?;
-
-        Ok((host, &request_line.uri, &request_line.method))
-    }
 
     pub fn backend_from_request(
         &mut self,
@@ -1409,18 +1417,13 @@ impl Session {
         }
         Ok(connect_action)
     }
+    */
 }
 
 impl ProxySession for Session {
     fn close(&mut self) {
-        //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.frontend_token, *self.temp.front_buf, *self.temp.back_buf);
-        match &mut self.state {
-            State::Invalid => unreachable!(),
-            State::Http(http) => http.close(),
-            _ => (),
-        }
-
         self.metrics.service_stop();
+
         self.cancel_timeouts();
         if let Some(front_socket) = self.front_socket() {
             if let Err(e) = front_socket.shutdown(Shutdown::Both) {
@@ -1430,8 +1433,16 @@ impl ProxySession for Session {
             }
         }
 
-        self.close_backend();
+        //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.frontend_token, *self.temp.front_buf, *self.temp.back_buf);
+        match &mut self.protocol {
+            State::Invalid => unreachable!(),
+            State::Http(http) => http.close(self.proxy, &mut self.metrics),
+            _ => (),
+        }
 
+        // self.close_backend();
+
+        /*
         match self.state {
             State::Invalid => unreachable!(),
             State::Http(ref mut http) => {
@@ -1455,6 +1466,7 @@ impl ProxySession for Session {
             State::Handshake(_) => gauge_add!("protocol.tls.handshake", -1),
             State::Http2(_) => todo!(),
         }
+        */
 
         if let Some(fd) = self.front_socket().map(|stream| stream.as_raw_fd()) {
             let proxy = self.proxy.borrow();
@@ -1470,7 +1482,7 @@ impl ProxySession for Session {
     }
 
     fn timeout(&mut self, token: Token) {
-        let session_result = match self.state {
+        let session_result = match self.protocol {
             State::Invalid => unreachable!(),
             State::Expect(_, _) => {
                 if token == self.frontend_token {
@@ -1508,34 +1520,43 @@ impl ProxySession for Session {
         self.last_event = Instant::now();
         self.metrics.wait_start();
 
-        if self.frontend_token == token {
-            self.front_readiness().event = self.front_readiness().event | events;
-        } else if self.back_token() == Some(token) {
-            self.back_readiness().map(|r| r.event |= events);
+        match self.protocol {
+            State::Http(http) => http.process_events(token, events),
+            _ => {}
         }
     }
 
     fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) {
-        self.metrics().service_start();
+        self.metrics.service_start();
 
-        match self.ready_inner(session) {
-            SessionResult::CloseSession => self.close(),
-            SessionResult::CloseBackend => self.close_backend(),
-            _ => {}
+        let protocol_result = match self.protocol {
+            State::Http(http) => http.ready(session, self.proxy, &mut self.metrics),
+            _ => ProtocolResult::Continue,
+        };
+
+        match protocol_result {
+            ProtocolResult::Upgrade => {
+                if self.upgrade() {
+                    self.ready(session);
+                }
+            }
+            ProtocolResult::Close => self.close(),
+            ProtocolResult::Continue => {}
+            _ => (),
         }
 
-        self.metrics().service_stop();
+        self.metrics.service_stop();
     }
 
     fn shutting_down(&mut self) {
-        let session_result = match self.state {
+        let session_result = match self.protocol {
             State::Invalid => unreachable!(),
             State::Http(ref mut http) => http.shutting_down(),
-            State::Handshake(_) => SessionResult::Continue,
-            _ => SessionResult::CloseSession,
+            State::Handshake(_) => ProtocolResult::Continue,
+            _ => ProtocolResult::Close,
         };
 
-        if session_result == SessionResult::CloseSession {
+        if session_result == ProtocolResult::Close {
             self.close();
         }
     }
@@ -1545,7 +1566,7 @@ impl ProxySession for Session {
     }
 
     fn print_state(&self) {
-        let protocol: String = match &self.state {
+        let protocol: String = match &self.protocol {
             State::Invalid => unreachable!(),
             State::Expect(_, _) => String::from("Expect"),
             State::Handshake(_) => String::from("Handshake"),
@@ -1554,33 +1575,31 @@ impl ProxySession for Session {
             State::WebSocket(_) => String::from("WSS"),
         };
 
-        let front_readiness = match self.state {
+        let front_readiness = match self.protocol {
             State::Invalid => unreachable!(),
             State::Expect(ref expect, _) => &expect.readiness,
             State::Handshake(ref handshake) => &handshake.readiness,
-            State::Http(ref http) => &http.front_readiness,
+            State::Http(ref http) => &http.frontend_readiness,
             State::Http2(_) => todo!(),
             State::WebSocket(ref pipe) => &pipe.front_readiness,
         };
-        let back_readiness = match self.state {
+        let back_readiness = match self.protocol {
             State::Invalid => unreachable!(),
-            State::Http(ref http) => Some(&http.back_readiness),
+            State::Http(ref http) => Some(&http.backend_readiness),
             State::Http2(_) => todo!(),
             State::WebSocket(ref pipe) => Some(&pipe.back_readiness),
             _ => None,
         };
 
         error!(
-            "zombie session[{:?} => {:?}], state => readiness: {:?} -> {:?}, protocol: {}, cluster_id: {:?}, back_connected: {:?}, metrics: {:?}",
-            self.frontend_token, self.back_token(), front_readiness, back_readiness, protocol, self.cluster_id, self.back_connected, self.metrics
+            "zombie session[{:?} => {:?}], state => readiness: {:?} -> {:?}, protocol: {}, metrics: {:?}",
+            self.frontend_token, self.back_token(), front_readiness, back_readiness, protocol, self.metrics
         );
     }
 
     fn tokens(&self) -> Vec<Token> {
-        let mut tokens = vec![self.frontend_token];
-        if let Some(token) = self.back_token() {
-            tokens.push(token)
-        }
+        let mut tokens = self.back_token();
+        tokens.insert(0, self.frontend_token);
         tokens
     }
 }
@@ -1637,7 +1656,7 @@ impl HttpListenerHandler for Listener {
     }
 
     fn get_connect_timeout(&self) -> u32 {
-        &self.config.connect_timeout
+        self.config.connect_timeout
     }
 
     // TODO factor out with http.rs
