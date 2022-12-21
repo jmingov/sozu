@@ -201,10 +201,10 @@ pub mod tcp;
 
 pub mod https;
 
-use std::{cell::RefCell, collections::BTreeMap, fmt, net::SocketAddr, rc::Rc, str};
+use std::{any, cell::RefCell, collections::BTreeMap, fmt, net::SocketAddr, rc::Rc, str};
 
 use anyhow::{bail, Context};
-use mio::{net::TcpStream, Token};
+use mio::{net::TcpStream, Interest, Token};
 use protocol::http::parser::Method;
 use time::{Duration, Instant};
 
@@ -311,7 +311,7 @@ pub enum AcceptError {
 }
 
 use self::server::ListenToken;
-pub trait ProxyConfiguration<Session> {
+pub trait ProxyConfiguration {
     fn notify(&mut self, message: ProxyRequest) -> ProxyResponse;
     fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError>;
     fn create_session(
@@ -322,6 +322,22 @@ pub trait ProxyConfiguration<Session> {
         proxy: Rc<RefCell<Self>>,
         // should we insert the tags here?
     ) -> Result<(), AcceptError>;
+}
+
+pub trait ProxyTrait {
+    fn register_socket(
+        &self,
+        socket: &mut TcpStream,
+        token: Token,
+        interest: Interest,
+    ) -> Result<(), std::io::Error>;
+
+    fn deregister_socket(&self, tcp_stream: &mut TcpStream) -> Result<(), std::io::Error>;
+
+    fn add_session(&self, session: Rc<RefCell<dyn ProxySession>>) -> Token;
+
+    /// returns true if the session was actually there before deletion
+    fn remove_session(&self, token: Token) -> bool;
 }
 
 #[derive(Debug, PartialEq, Eq)]

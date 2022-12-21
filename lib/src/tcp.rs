@@ -42,7 +42,7 @@ use crate::{
     timer::TimeoutContainer,
     util::UnwrapLog,
     AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ListenerHandler, Protocol,
-    ProxyConfiguration, ProxySession, Readiness, SessionMetrics, SessionResult,
+    ProxyConfiguration, ProxySession, Readiness, SessionMetrics, SessionResult, ProxyTrait,
 };
 
 pub enum UpgradeResult {
@@ -1289,7 +1289,7 @@ impl Proxy {
     }
 }
 
-impl ProxyConfiguration<Session> for Proxy {
+impl ProxyConfiguration for Proxy {
     fn notify(&mut self, message: ProxyRequest) -> ProxyResponse {
         match message.order {
             ProxyRequestOrder::AddTcpFrontend(front) => {
@@ -1485,6 +1485,36 @@ impl ProxyConfiguration<Session> for Proxy {
         session_manager.incr();
 
         Ok(())
+    }
+}
+
+impl ProxyTrait for Proxy {
+    fn register_socket(
+        &self,
+        socket: &mut TcpStream,
+        token: Token,
+        interest: Interest,
+    ) -> Result<(), std::io::Error> {
+        self.registry.register(socket, token, interest)
+    }
+
+    fn deregister_socket(&self, tcp_stream: &mut TcpStream) -> Result<(), std::io::Error> {
+        self.registry.deregister(tcp_stream)
+    }
+
+    fn add_session(&self, session: Rc<RefCell<dyn ProxySession>>) -> Token {
+        let entry = self.sessions.borrow_mut().slab.vacant_entry();
+        let backend_token = Token(entry.key());
+        let _entry = entry.insert(session);
+        backend_token
+    }
+
+    fn remove_session(&self, token: Token) -> bool {
+        self.sessions
+            .borrow_mut()
+            .slab
+            .try_remove(token.0)
+            .is_some()
     }
 }
 

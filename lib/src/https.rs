@@ -69,7 +69,7 @@ use crate::{
     },
     util::UnwrapLog,
     AcceptError, HttpListenerHandler, ListenerHandler, Protocol, ProxyConfiguration, ProxySession,
-    Readiness, SessionMetrics, SessionResult,
+    Readiness, SessionMetrics, SessionResult, ProxyTrait,
 };
 
 // const SERVER_PROTOS: &[&str] = &["http/1.1", "h2"];
@@ -2240,7 +2240,7 @@ impl Proxy {
     }
 }
 
-impl ProxyConfiguration<Session> for Proxy {
+impl ProxyConfiguration for Proxy {
     fn accept(&mut self, token: ListenToken) -> Result<MioTcpStream, AcceptError> {
         match self.listeners.get(&Token(token.0)) {
             Some(listener) => listener.borrow_mut().accept(),
@@ -2435,6 +2435,35 @@ impl ProxyConfiguration<Session> for Proxy {
                 ProxyResponse::error(request_id, format!("{:#}", error_message))
             }
         }
+    }
+}
+impl ProxyTrait for Proxy {
+    fn register_socket(
+        &self,
+        socket: &mut MioTcpStream,
+        token: Token,
+        interest: Interest,
+    ) -> Result<(), std::io::Error> {
+        self.registry.register(socket, token, interest)
+    }
+
+    fn deregister_socket(&self, tcp_stream: &mut MioTcpStream) -> Result<(), std::io::Error> {
+        self.registry.deregister(tcp_stream)
+    }
+
+    fn add_session(&self, session: Rc<RefCell<dyn ProxySession>>) -> Token {
+        let entry = self.sessions.borrow_mut().slab.vacant_entry();
+        let backend_token = Token(entry.key());
+        let _entry = entry.insert(session);
+        backend_token
+    }
+
+    fn remove_session(&self, token: Token) -> bool {
+        self.sessions
+            .borrow_mut()
+            .slab
+            .try_remove(token.0)
+            .is_some()
     }
 }
 

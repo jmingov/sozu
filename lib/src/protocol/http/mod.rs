@@ -30,7 +30,8 @@ use crate::{
     timer::TimeoutContainer,
     util::UnwrapLog,
     Backend, BackendConnectAction, BackendConnectionStatus, HttpListenerHandler, ListenerHandler,
-    LogDuration, ProxySession, {Protocol, Readiness, SessionMetrics, SessionResult},
+    LogDuration, ProxyConfiguration, ProxySession, ProxyTrait,
+    {Protocol, Readiness, SessionMetrics, SessionResult},
 };
 
 use self::parser::{
@@ -1917,15 +1918,15 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
     }
 
     //FIXME: check the token passed as argument
-    fn close_backend(&mut self, proxy: Rc<RefCell<Proxy>>, metrics: &mut SessionMetrics) {
+    fn close_backend(&mut self, proxy: Rc<RefCell<dyn ProxyTrait>>, metrics: &mut SessionMetrics) {
         if let Some(token) = self.backend_token {
-            if let Some(fd) = self.backend_socket.map(|s| s.as_raw_fd()) {
+            if let Some(socket) = self.backend_socket {
                 let proxy = proxy.borrow();
-                if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
-                    error!("1error deregistering socket({:?}): {:?}", fd, e);
+                if let Err(e) = proxy.deregister_socket(&mut socket) {
+                    error!("error deregistering socket({:?}): {:?}", socket, e);
                 }
 
-                proxy.sessions.borrow_mut().slab.try_remove(token.0);
+                proxy.remove_session(token);
             }
 
             self.remove_backend();
@@ -2026,7 +2027,10 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
         Ok((host, &request_line.uri, &request_line.method))
     }
 
-    fn cluster_id_from_request(&mut self, proxy: Rc<RefCell<Proxy>>) -> anyhow::Result<String> {
+    fn cluster_id_from_request(
+        &mut self,
+        proxy: Rc<RefCell<dyn ProxyTrait>>,
+    ) -> anyhow::Result<String> {
         let (host, uri, method) = match self.extract_route() {
             Ok(tuple) => tuple,
             Err(e) => {
@@ -2078,7 +2082,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
         &mut self,
         cluster_id: &str,
         frontend_should_stick: bool,
-        proxy: Rc<RefCell<Proxy>>,
+        proxy: Rc<RefCell<dyn ProxyTrait>>,
         metrics: &mut SessionMetrics,
     ) -> anyhow::Result<TcpStream> {
         let sticky_session = self
@@ -2129,7 +2133,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
         frontend_should_stick: bool,
         sticky_session: Option<&str>,
         cluster_id: &str,
-        proxy: Rc<RefCell<Proxy>>,
+        proxy: Rc<RefCell<dyn ProxyTrait>>,
     ) -> anyhow::Result<(Rc<RefCell<Backend>>, TcpStream)> {
         match (frontend_should_stick, sticky_session) {
             (true, Some(sticky_session)) => proxy
@@ -2154,7 +2158,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
     fn connect_to_backend(
         &mut self,
         session_rc: Rc<RefCell<dyn ProxySession>>,
-        proxy: Rc<RefCell<Proxy>>,
+        proxy: Rc<RefCell<dyn ProxyTrait>>,
         metrics: &mut SessionMetrics,
     ) -> anyhow::Result<BackendConnectAction> {
         let old_cluster_id = self.cluster_id.clone();
@@ -2234,7 +2238,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
         match old_backend_token {
             Some(backend_token) => {
                 self.set_backend_token(backend_token);
-                if let Err(e) = proxy.borrow().registry.register(
+                if let Err(e) = proxy.borrow().register_socket(
                     &mut socket,
                     backend_token,
                     Interest::READABLE | Interest::WRITABLE,
@@ -2248,6 +2252,8 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                 Ok(BackendConnectAction::Replace)
             }
             None => {
+                /*
+                TODO: rewrite elsewhere
                 let not_enough_memory = {
                     let sessions = proxy.borrow().sessions.borrow();
                     sessions.slab.len() >= sessions.slab_capacity()
@@ -2258,16 +2264,11 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                     self.set_answer(DefaultAnswerStatus::Answer503, None);
                     bail!(format!("Too many connections on cluster {}", cluster_id));
                 }
+                */
 
-                let backend_token = {
-                    let mut sessions = proxy.borrow().sessions.borrow_mut();
-                    let entry = sessions.slab.vacant_entry();
-                    let backend_token = Token(entry.key());
-                    let _entry = entry.insert(session_rc);
-                    backend_token
-                };
+                let backend_token = proxy.borrow().add_session(session_rc);
 
-                if let Err(e) = proxy.borrow().registry.register(
+                if let Err(e) = proxy.borrow().register_socket(
                     &mut socket,
                     backend_token,
                     Interest::READABLE | Interest::WRITABLE,
@@ -2374,7 +2375,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
     fn ready_inner(
         &mut self,
         session: Rc<RefCell<dyn crate::ProxySession>>,
-        proxy: Rc<RefCell<Proxy>>,
+        proxy: Rc<RefCell<dyn ProxyTrait>>,
         metrics: &mut SessionMetrics,
     ) -> SessionResult {
         let mut counter = 0;
@@ -2596,7 +2597,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> SessionStat
     fn ready(
         &mut self,
         session: Rc<RefCell<dyn crate::ProxySession>>,
-        proxy: Rc<RefCell<Proxy>>,
+        proxy: Rc<RefCell<dyn ProxyTrait>>,
         metrics: &mut SessionMetrics,
     ) -> ProtocolResult {
         match self.ready_inner(session, proxy, metrics) {
@@ -2627,7 +2628,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> SessionStat
         }
     }
 
-    fn close(&mut self, proxy: Rc<RefCell<Proxy>>, metrics: &mut SessionMetrics) {
+    fn close(&mut self, proxy: Rc<RefCell<dyn ProxyTrait>>, metrics: &mut SessionMetrics) {
         self.close_backend(proxy, metrics);
 
         //if the state was initial, the connection was already reset
