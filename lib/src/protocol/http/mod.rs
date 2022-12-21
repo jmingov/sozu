@@ -7,20 +7,18 @@ use std::{
     cmp::min,
     io::ErrorKind,
     net::{IpAddr, Shutdown, SocketAddr},
-    os::unix::prelude::AsRawFd,
     rc::{Rc, Weak},
     str::from_utf8_unchecked,
 };
 
 use anyhow::{bail, Context};
-use mio::{net::TcpStream, unix::SourceFd, *};
+use mio::{net::TcpStream, *};
 use rusty_ulid::Ulid;
 use sozu_command::proxy::{ProxyEvent, Route};
 use time::{Duration, Instant};
 
 use crate::{
     buffer_queue::BufferQueue,
-    http::Proxy,
     pool::Pool,
     protocol::ProtocolResult,
     retry::RetryPolicy,
@@ -29,8 +27,8 @@ use crate::{
     sozu_command::ready::Ready,
     timer::TimeoutContainer,
     util::UnwrapLog,
-    Backend, BackendConnectAction, BackendConnectionStatus, HttpListenerHandler, ListenerHandler,
-    LogDuration, ProxyConfiguration, ProxySession, ProxyTrait,
+    Backend, BackendConnectAction, BackendConnectionStatus, HttpListenerHandler, HttpProxyTrait,
+    ListenerHandler, LogDuration, ProxySession,
     {Protocol, Readiness, SessionMetrics, SessionResult},
 };
 
@@ -119,7 +117,6 @@ pub struct Http<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> 
     configured_backend_timeout: u32,
     closing: bool,
     pub cluster_id: Option<String>,
-    // configured_backend_timeout: Duration,
     connection_attempts: u8,
     pub frontend_buffer: Option<BufferQueue>,
     pub frontend_readiness: Readiness,
@@ -1918,11 +1915,15 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
     }
 
     //FIXME: check the token passed as argument
-    fn close_backend(&mut self, proxy: Rc<RefCell<dyn ProxyTrait>>, metrics: &mut SessionMetrics) {
+    fn close_backend(
+        &mut self,
+        proxy: Rc<RefCell<dyn HttpProxyTrait>>,
+        metrics: &mut SessionMetrics,
+    ) {
         if let Some(token) = self.backend_token {
-            if let Some(socket) = self.backend_socket {
+            if let Some(socket) = &mut self.backend_socket {
                 let proxy = proxy.borrow();
-                if let Err(e) = proxy.deregister_socket(&mut socket) {
+                if let Err(e) = proxy.deregister_socket(socket) {
                     error!("error deregistering socket({:?}): {:?}", socket, e);
                 }
 
@@ -1934,10 +1935,10 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
             if self.backend_connection_status != BackendConnectionStatus::NotConnected {
                 self.backend_readiness.event = Ready::empty();
 
-                if let Some(sock) = self.backend_socket {
-                    if let Err(e) = sock.shutdown(Shutdown::Both) {
+                if let Some(socket) = &mut self.backend_socket {
+                    if let Err(e) = socket.shutdown(Shutdown::Both) {
                         if e.kind() != ErrorKind::NotConnected {
-                            error!("error shutting down back socket({:?}): {:?}", sock, e);
+                            error!("error shutting down back socket({:?}): {:?}", socket, e);
                         }
                     }
                 }
@@ -2029,7 +2030,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
 
     fn cluster_id_from_request(
         &mut self,
-        proxy: Rc<RefCell<dyn ProxyTrait>>,
+        proxy: Rc<RefCell<dyn HttpProxyTrait>>,
     ) -> anyhow::Result<String> {
         let (host, uri, method) = match self.extract_route() {
             Ok(tuple) => tuple,
@@ -2061,7 +2062,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
 
         let frontend_should_redirect_https = proxy
             .borrow()
-            .clusters
+            .clusters()
             .get(&cluster_id)
             .map(|cluster| cluster.https_redirect)
             .unwrap_or(false);
@@ -2082,7 +2083,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
         &mut self,
         cluster_id: &str,
         frontend_should_stick: bool,
-        proxy: Rc<RefCell<dyn ProxyTrait>>,
+        proxy: Rc<RefCell<dyn HttpProxyTrait>>,
         metrics: &mut SessionMetrics,
     ) -> anyhow::Result<TcpStream> {
         let sticky_session = self
@@ -2133,12 +2134,12 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
         frontend_should_stick: bool,
         sticky_session: Option<&str>,
         cluster_id: &str,
-        proxy: Rc<RefCell<dyn ProxyTrait>>,
+        proxy: Rc<RefCell<dyn HttpProxyTrait>>,
     ) -> anyhow::Result<(Rc<RefCell<Backend>>, TcpStream)> {
         match (frontend_should_stick, sticky_session) {
             (true, Some(sticky_session)) => proxy
                 .borrow()
-                .backends
+                .backends()
                 .borrow_mut()
                 .backend_from_sticky_session(cluster_id, sticky_session)
                 .with_context(|| {
@@ -2149,7 +2150,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                 }),
             _ => proxy
                 .borrow()
-                .backends
+                .backends()
                 .borrow_mut()
                 .backend_from_cluster_id(cluster_id),
         }
@@ -2158,7 +2159,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
     fn connect_to_backend(
         &mut self,
         session_rc: Rc<RefCell<dyn ProxySession>>,
-        proxy: Rc<RefCell<dyn ProxyTrait>>,
+        proxy: Rc<RefCell<dyn HttpProxyTrait>>,
         metrics: &mut SessionMetrics,
     ) -> anyhow::Result<BackendConnectAction> {
         let old_cluster_id = self.cluster_id.clone();
@@ -2168,7 +2169,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
             .with_context(|| "Circuit broke")?;
 
         let cluster_id = self
-            .cluster_id_from_request(proxy)
+            .cluster_id_from_request(proxy.clone())
             .with_context(|| "Could not get cluster id from request")?;
 
         // check if we can reuse the backend connection
@@ -2182,7 +2183,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                     let backend = backend.borrow();
                     proxy
                         .borrow()
-                        .backends
+                        .backends()
                         .borrow()
                         .has_backend(&cluster_id, &backend)
                 })
@@ -2191,7 +2192,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
             if has_backend && self.check_backend_connection(metrics) {
                 return Ok(BackendConnectAction::Reuse);
             } else if let Some(token) = self.backend_token {
-                self.close_backend(proxy, metrics);
+                self.close_backend(proxy.clone(), metrics);
 
                 //reset the back token here so we can remove it
                 //from the slab after backend_from* fails
@@ -2202,7 +2203,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
         //replacing with a connection to another cluster
         if old_cluster_id.is_some() && old_cluster_id.as_ref() != Some(&cluster_id) {
             if let Some(token) = self.backend_token {
-                self.close_backend(proxy, metrics);
+                self.close_backend(proxy.clone(), metrics);
 
                 //reset the back token here so we can remove it
                 //from the slab after backend_from* fails
@@ -2214,13 +2215,13 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
 
         let frontend_should_stick = proxy
             .borrow()
-            .clusters
+            .clusters()
             .get(&cluster_id)
             .map(|cluster| cluster.sticky_session)
             .unwrap_or(false);
 
         let mut socket =
-            self.backend_from_request(&cluster_id, frontend_should_stick, proxy, metrics)?;
+            self.backend_from_request(&cluster_id, frontend_should_stick, proxy.clone(), metrics)?;
         if let Err(e) = socket.set_nodelay(true) {
             error!(
                 "error setting nodelay on back socket({:?}): {:?}",
@@ -2246,7 +2247,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                     error!("error registering back socket({:?}): {:?}", socket, e);
                 }
 
-                self.set_backend_socket(socket, self.backend);
+                self.set_backend_socket(socket, self.backend.clone());
                 self.set_backend_timeout(connect_timeout);
 
                 Ok(BackendConnectAction::Replace)
@@ -2276,7 +2277,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                     error!("error registering back socket({:?}): {:?}", socket, e);
                 }
 
-                self.set_backend_socket(socket, self.backend);
+                self.set_backend_socket(socket, self.backend.clone());
                 self.set_backend_token(backend_token);
                 self.set_backend_timeout(connect_timeout);
 
@@ -2304,8 +2305,8 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
 
             // the back timeout was of connect_timeout duration before,
             // now that we're connected, move to backend_timeout duration
-            // let timeout = self.backend_timeout.duration();
-            self.set_backend_timeout(self.backend_timeout.duration());
+            let timeout = self.backend_timeout.duration();
+            self.set_backend_timeout(timeout);
             self.cancel_backend_timeout();
 
             if let Some(backend) = &self.backend {
@@ -2375,7 +2376,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
     fn ready_inner(
         &mut self,
         session: Rc<RefCell<dyn crate::ProxySession>>,
-        proxy: Rc<RefCell<dyn ProxyTrait>>,
+        proxy: Rc<RefCell<dyn HttpProxyTrait>>,
         metrics: &mut SessionMetrics,
     ) -> SessionResult {
         let mut counter = 0;
@@ -2400,8 +2401,8 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                     BackendConnectionStatus::Connecting(Instant::now());
 
                 // trigger a backend reconnection
-                self.close_backend(proxy, metrics);
-                match self.connect_to_backend(session.clone(), proxy, metrics) {
+                self.close_backend(proxy.clone(), metrics);
+                match self.connect_to_backend(session.clone(), proxy.clone(), metrics) {
                     // reuse connection or send a default answer, we can continue
                     Ok(BackendConnectAction::Reuse) => {}
                     Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
@@ -2460,7 +2461,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                 match session_result {
                     // TODO: verify ReconnectBackend makes sense here
                     SessionResult::ConnectBackend => {
-                        match self.connect_to_backend(session.clone(), proxy, metrics) {
+                        match self.connect_to_backend(session.clone(), proxy.clone(), metrics) {
                             // reuse connection or send a default answer, we can continue
                             Ok(BackendConnectAction::Reuse) => {}
                             Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
@@ -2597,10 +2598,10 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> SessionStat
     fn ready(
         &mut self,
         session: Rc<RefCell<dyn crate::ProxySession>>,
-        proxy: Rc<RefCell<dyn ProxyTrait>>,
+        proxy: Rc<RefCell<dyn HttpProxyTrait>>,
         metrics: &mut SessionMetrics,
     ) -> ProtocolResult {
-        match self.ready_inner(session, proxy, metrics) {
+        match self.ready_inner(session, proxy.clone(), metrics) {
             SessionResult::CloseSession => ProtocolResult::Close,
             SessionResult::CloseBackend => {
                 self.close_backend(proxy, metrics);
@@ -2628,7 +2629,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> SessionStat
         }
     }
 
-    fn close(&mut self, proxy: Rc<RefCell<dyn ProxyTrait>>, metrics: &mut SessionMetrics) {
+    fn close(&mut self, proxy: Rc<RefCell<dyn HttpProxyTrait>>, metrics: &mut SessionMetrics) {
         self.close_backend(proxy, metrics);
 
         //if the state was initial, the connection was already reset

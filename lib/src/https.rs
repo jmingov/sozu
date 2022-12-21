@@ -68,8 +68,8 @@ use crate::{
         ParsedCertificateAndKey,
     },
     util::UnwrapLog,
-    AcceptError, HttpListenerHandler, ListenerHandler, Protocol, ProxyConfiguration, ProxySession,
-    Readiness, SessionMetrics, SessionResult, ProxyTrait,
+    AcceptError, HttpListenerHandler, HttpProxyTrait, ListenerHandler, Protocol,
+    ProxyConfiguration, ProxySession, Readiness, SessionMetrics, SessionResult,
 };
 
 // const SERVER_PROTOS: &[&str] = &["http/1.1", "h2"];
@@ -401,7 +401,7 @@ impl Session {
             http.frontend_socket,
             front_token,
             http.request_id,
-            http.cluster_id,
+            http.cluster_id.clone(),
             http.backend_id,
             Some(ws_context),
             http.backend_socket,
@@ -468,7 +468,6 @@ impl Session {
             State::Http2(_) => todo!(),
         }
     }
-    */
 
     fn log_context(&self) -> String {
         match &self.protocol {
@@ -478,7 +477,6 @@ impl Session {
         }
     }
 
-    /*
             fn readable(&mut self) -> SessionResult {
                 let (upgrade, session_result) = match &mut self.state {
                     State::Invalid => unreachable!(),
@@ -724,6 +722,7 @@ impl Session {
         }
     }
 
+    /*
     fn back_readiness(&mut self) -> Option<&mut Readiness> {
         match self.protocol {
             State::Invalid => unreachable!(),
@@ -734,7 +733,6 @@ impl Session {
         }
     }
 
-    /*
 
     fn fail_backend_connection(&mut self) {
         self.backend.as_ref().map(|backend| {
@@ -1436,7 +1434,7 @@ impl ProxySession for Session {
         //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.frontend_token, *self.temp.front_buf, *self.temp.back_buf);
         match &mut self.protocol {
             State::Invalid => unreachable!(),
-            State::Http(http) => http.close(self.proxy, &mut self.metrics),
+            State::Http(http) => http.close(self.proxy.clone(), &mut self.metrics),
             _ => (),
         }
 
@@ -1470,14 +1468,11 @@ impl ProxySession for Session {
 
         if let Some(fd) = self.front_socket().map(|stream| stream.as_raw_fd()) {
             let proxy = self.proxy.borrow();
+            // TODO: rewrite with proxy.deregister_socket()
             if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
                 error!("1error deregistering socket({:?}): {:?}", fd, e);
             }
-            proxy
-                .sessions
-                .borrow_mut()
-                .slab
-                .try_remove(self.frontend_token.0);
+            proxy.remove_session(self.frontend_token);
         }
     }
 
@@ -1520,7 +1515,7 @@ impl ProxySession for Session {
         self.last_event = Instant::now();
         self.metrics.wait_start();
 
-        match self.protocol {
+        match &mut self.protocol {
             State::Http(http) => http.process_events(token, events),
             _ => {}
         }
@@ -1529,8 +1524,8 @@ impl ProxySession for Session {
     fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) {
         self.metrics.service_start();
 
-        let protocol_result = match self.protocol {
-            State::Http(http) => http.ready(session, self.proxy, &mut self.metrics),
+        let protocol_result = match &mut self.protocol {
+            State::Http(http) => http.ready(session.clone(), self.proxy.clone(), &mut self.metrics),
             _ => ProtocolResult::Continue,
         };
 
@@ -2437,7 +2432,7 @@ impl ProxyConfiguration for Proxy {
         }
     }
 }
-impl ProxyTrait for Proxy {
+impl HttpProxyTrait for Proxy {
     fn register_socket(
         &self,
         socket: &mut MioTcpStream,
@@ -2452,10 +2447,11 @@ impl ProxyTrait for Proxy {
     }
 
     fn add_session(&self, session: Rc<RefCell<dyn ProxySession>>) -> Token {
-        let entry = self.sessions.borrow_mut().slab.vacant_entry();
-        let backend_token = Token(entry.key());
+        let mut session_manager = self.sessions.borrow_mut();
+        let entry = session_manager.slab.vacant_entry();
+        let token = Token(entry.key());
         let _entry = entry.insert(session);
-        backend_token
+        token
     }
 
     fn remove_session(&self, token: Token) -> bool {
@@ -2464,6 +2460,14 @@ impl ProxyTrait for Proxy {
             .slab
             .try_remove(token.0)
             .is_some()
+    }
+
+    fn backends(&self) -> Rc<RefCell<BackendMap>> {
+        self.backends.clone()
+    }
+
+    fn clusters(&self) -> &HashMap<ClusterId, Cluster> {
+        &self.clusters
     }
 }
 

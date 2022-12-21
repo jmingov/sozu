@@ -201,19 +201,27 @@ pub mod tcp;
 
 pub mod https;
 
-use std::{any, cell::RefCell, collections::BTreeMap, fmt, net::SocketAddr, rc::Rc, str};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashMap},
+    fmt,
+    net::SocketAddr,
+    rc::Rc,
+    str,
+};
 
 use anyhow::{bail, Context};
 use mio::{net::TcpStream, Interest, Token};
 use protocol::http::parser::Method;
+use sozu_command::state::ClusterId;
 use time::{Duration, Instant};
 
 use crate::sozu_command::{
-    proxy::{LoadBalancingParams, ProxyEvent, ProxyRequest, ProxyResponse, Route},
+    proxy::{Cluster, LoadBalancingParams, ProxyEvent, ProxyRequest, ProxyResponse, Route},
     ready::Ready,
 };
 
-use self::retry::RetryPolicy;
+use self::{backends::BackendMap, retry::RetryPolicy};
 
 /// Anything that can be registered in mio (subscribe to kernel events)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -324,7 +332,7 @@ pub trait ProxyConfiguration {
     ) -> Result<(), AcceptError>;
 }
 
-pub trait ProxyTrait {
+pub trait HttpProxyTrait {
     fn register_socket(
         &self,
         socket: &mut TcpStream,
@@ -338,6 +346,14 @@ pub trait ProxyTrait {
 
     /// returns true if the session was actually there before deletion
     fn remove_session(&self, token: Token) -> bool;
+
+    // fn has_backend(&self, cluster_id: &str, backend: &Backend) -> bool;
+
+    // fn frontend_should_redirect_https(&self, cluster_id: &str) -> bool;
+
+    fn backends(&self) -> Rc<RefCell<BackendMap>>;
+
+    fn clusters(&self) -> &HashMap<ClusterId, Cluster>;
 }
 
 #[derive(Debug, PartialEq, Eq)]

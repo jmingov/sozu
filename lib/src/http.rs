@@ -29,7 +29,7 @@ use crate::{
     },
     timer::TimeoutContainer,
     util::UnwrapLog,
-    HttpListenerHandler, ListenerHandler, ProxyTrait,
+    HttpListenerHandler, HttpProxyTrait, ListenerHandler,
 };
 
 use super::{
@@ -551,8 +551,8 @@ impl ProxySession for Session {
             }
         }
 
-        match self.protocol {
-            Some(State::Http(http)) => http.close(self.proxy, &mut self.metrics),
+        match &mut self.protocol {
+            Some(State::Http(http)) => http.close(self.proxy.clone(), &mut self.metrics),
             Some(State::WebSocket(ws)) => ws.close(),
             Some(State::Expect(expect)) => {} // expect.close(),
             None => {}
@@ -619,7 +619,7 @@ impl ProxySession for Session {
         self.last_event = Instant::now();
         self.metrics.wait_start();
 
-        match self.protocol {
+        match &mut self.protocol {
             Some(State::Http(http)) => http.process_events(token, events),
             _ => {}
         }
@@ -628,8 +628,10 @@ impl ProxySession for Session {
     fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) {
         self.metrics.service_start();
 
-        let protocol_result = match self.protocol {
-            Some(State::Http(http)) => http.ready(session, self.proxy, &mut self.metrics),
+        let protocol_result = match &mut self.protocol {
+            Some(State::Http(http)) => {
+                http.ready(session.clone(), self.proxy.clone(), &mut self.metrics)
+            }
             _ => ProtocolResult::Continue,
         };
 
@@ -1220,7 +1222,7 @@ impl ProxyConfiguration for Proxy {
     }
 }
 
-impl ProxyTrait for Proxy {
+impl HttpProxyTrait for Proxy {
     fn register_socket(
         &self,
         source: &mut TcpStream,
@@ -1235,10 +1237,11 @@ impl ProxyTrait for Proxy {
     }
 
     fn add_session(&self, session: Rc<RefCell<dyn ProxySession>>) -> Token {
-        let entry = self.sessions.borrow_mut().slab.vacant_entry();
-        let backend_token = Token(entry.key());
+        let mut session_manager = self.sessions.borrow_mut();
+        let entry = session_manager.slab.vacant_entry();
+        let token = Token(entry.key());
         let _entry = entry.insert(session);
-        backend_token
+        token
     }
 
     fn remove_session(&self, token: Token) -> bool {
@@ -1247,6 +1250,14 @@ impl ProxyTrait for Proxy {
             .slab
             .try_remove(token.0)
             .is_some()
+    }
+
+    fn backends(&self) -> Rc<RefCell<BackendMap>> {
+        self.backends.clone()
+    }
+
+    fn clusters(&self) -> &HashMap<ClusterId, Cluster> {
+        &self.clusters
     }
 }
 
