@@ -181,7 +181,7 @@ impl<Front: SocketHandler + Read> ExpectProxyProtocol<Front> {
             listener,
         );
 
-        pipe.front_readiness.event = self.readiness.event;
+        pipe.frontend_readiness.event = self.readiness.event;
 
         if let Some(backend_token) = backend_token {
             pipe.set_back_token(backend_token);

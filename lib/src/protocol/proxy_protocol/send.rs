@@ -181,11 +181,11 @@ impl<Front: SocketHandler + Read> SendProxyProtocol<Front> {
             listener,
         );
 
-        pipe.front_readiness = self.front_readiness;
-        pipe.back_readiness = self.back_readiness;
+        pipe.frontend_readiness = self.front_readiness;
+        pipe.backend_readiness = self.back_readiness;
 
-        pipe.front_readiness.interest.insert(Ready::readable());
-        pipe.back_readiness.interest.insert(Ready::readable());
+        pipe.frontend_readiness.interest.insert(Ready::readable());
+        pipe.backend_readiness.interest.insert(Ready::readable());
 
         if let Some(back_token) = self.backend_token {
             pipe.set_back_token(back_token);

@@ -2427,7 +2427,6 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
             return SessionResult::CloseSession;
         }
 
-        let token = self.frontend_token;
         while counter < max_loop_iterations {
             let frontend_interest = self.frontend_readiness.filter_interest();
             let backend_interest = self.backend_readiness.filter_interest();
@@ -2435,7 +2434,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
             trace!(
                 "PROXY\t{} {:?} {:?} -> {:?}",
                 self.log_context(),
-                token,
+                self.frontend_token,
                 self.frontend_readiness,
                 self.backend_readiness
             );
@@ -2622,9 +2621,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> SessionStat
     fn process_events(&mut self, token: Token, events: Ready) {
         if self.frontend_token == token {
             self.frontend_readiness.event |= events;
-            return;
-        }
-        if self.backend_token == Some(token) {
+        } else if self.backend_token == Some(token) {
             self.backend_readiness.event |= events;
         }
     }

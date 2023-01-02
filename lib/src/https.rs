@@ -154,7 +154,12 @@ impl Session {
             )
         } else {
             gauge_add!("protocol.tls.handshake", 1);
-            State::Handshake(RustlsHandshake::new(rustls_details, sock, request_id))
+            State::Handshake(RustlsHandshake::new(
+                rustls_details,
+                sock,
+                token,
+                request_id,
+            ))
         };
 
         let metrics = SessionMetrics::new(Some(wait_time));
@@ -234,9 +239,9 @@ impl Session {
                     ..
                 } = expect;
 
-                let mut tls = RustlsHandshake::new(ssl, frontend, request_id);
-                tls.readiness.event = readiness.event;
-                tls.readiness.event.insert(Ready::readable());
+                let mut tls = RustlsHandshake::new(ssl, frontend, self.frontend_token, request_id);
+                tls.frontend_readiness.event = readiness.event;
+                tls.frontend_readiness.event.insert(Ready::readable());
 
                 gauge_add!("protocol.proxy.expect", -1);
                 gauge_add!("protocol.tls.handshake", 1);
@@ -288,7 +293,7 @@ impl Session {
             session: handshake.session,
         };
 
-        let readiness = handshake.readiness.clone();
+        let readiness = handshake.frontend_readiness.clone();
 
         gauge_add!("protocol.tls.handshake", -1);
         match alpn {
@@ -412,14 +417,14 @@ impl Session {
             self.listener.clone(),
         );
 
-        pipe.front_readiness.event = http.frontend_readiness.event;
-        pipe.back_readiness.event = http.backend_readiness.event;
+        pipe.frontend_readiness.event = http.frontend_readiness.event;
+        pipe.backend_readiness.event = http.backend_readiness.event;
         http.frontend_timeout
             .set_duration(self.frontend_timeout_duration);
         http.backend_timeout
             .set_duration(self.backend_timeout_duration);
-        pipe.front_timeout = Some(http.frontend_timeout);
-        pipe.back_timeout = Some(http.backend_timeout);
+        pipe.frontend_timeout = Some(http.frontend_timeout);
+        pipe.backend_timeout = Some(http.backend_timeout);
         pipe.set_back_token(back_token);
         pipe.set_cluster_id(http.cluster_id.clone());
 
@@ -715,9 +720,9 @@ impl Session {
         match self.protocol {
             State::Invalid => unreachable!(),
             State::Expect(ref mut expect, _) => &mut expect.readiness,
-            State::Handshake(ref mut handshake) => &mut handshake.readiness,
+            State::Handshake(ref mut handshake) => &mut handshake.frontend_readiness,
             State::Http(ref mut http) => http.frontend_readiness(),
-            State::WebSocket(ref mut pipe) => &mut pipe.front_readiness,
+            State::WebSocket(ref mut pipe) => &mut pipe.frontend_readiness,
             State::Http2(_) => todo!(),
         }
     }
@@ -1525,8 +1530,16 @@ impl ProxySession for Session {
         self.metrics.service_start();
 
         let protocol_result = match &mut self.protocol {
+            State::Invalid => unreachable!(),
             State::Http(http) => http.ready(session.clone(), self.proxy.clone(), &mut self.metrics),
-            _ => ProtocolResult::Continue,
+            State::Expect(_, _) => todo!(),
+            State::Handshake(handshake) => {
+                handshake.ready(session.clone(), self.proxy.clone(), &mut self.metrics)
+            }
+            State::WebSocket(websocket) => {
+                websocket.ready(session.clone(), self.proxy.clone(), &mut self.metrics)
+            }
+            State::Http2(_) => todo!(),
         };
 
         match protocol_result {
@@ -1537,7 +1550,6 @@ impl ProxySession for Session {
             }
             ProtocolResult::Close => self.close(),
             ProtocolResult::Continue => {}
-            _ => (),
         }
 
         self.metrics.service_stop();
@@ -1573,16 +1585,16 @@ impl ProxySession for Session {
         let front_readiness = match self.protocol {
             State::Invalid => unreachable!(),
             State::Expect(ref expect, _) => &expect.readiness,
-            State::Handshake(ref handshake) => &handshake.readiness,
+            State::Handshake(ref handshake) => &handshake.frontend_readiness,
             State::Http(ref http) => &http.frontend_readiness,
             State::Http2(_) => todo!(),
-            State::WebSocket(ref pipe) => &pipe.front_readiness,
+            State::WebSocket(ref pipe) => &pipe.frontend_readiness,
         };
         let back_readiness = match self.protocol {
             State::Invalid => unreachable!(),
             State::Http(ref http) => Some(&http.backend_readiness),
             State::Http2(_) => todo!(),
-            State::WebSocket(ref pipe) => Some(&pipe.back_readiness),
+            State::WebSocket(ref pipe) => Some(&pipe.backend_readiness),
             _ => None,
         };
 

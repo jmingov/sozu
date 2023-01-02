@@ -235,7 +235,7 @@ impl Session {
 
     fn front_hup(&mut self) -> SessionResult {
         match self.protocol {
-            Some(State::Pipe(ref mut pipe)) => pipe.front_hup(&mut self.metrics),
+            Some(State::Pipe(ref mut pipe)) => pipe.frontend_hup(&mut self.metrics),
             _ => {
                 self.log_request();
                 SessionResult::CloseSession
@@ -245,7 +245,7 @@ impl Session {
 
     fn back_hup(&mut self) -> SessionResult {
         match self.protocol {
-            Some(State::Pipe(ref mut pipe)) => pipe.back_hup(&mut self.metrics),
+            Some(State::Pipe(ref mut pipe)) => pipe.backend_hup(&mut self.metrics),
             _ => {
                 self.log_request();
                 SessionResult::CloseSession
@@ -304,7 +304,7 @@ impl Session {
         }
 
         match self.protocol {
-            Some(State::Pipe(ref mut pipe)) => pipe.back_readable(&mut self.metrics),
+            Some(State::Pipe(ref mut pipe)) => pipe.backend_readable(&mut self.metrics),
             _ => SessionResult::Continue,
         }
     }
@@ -313,7 +313,7 @@ impl Session {
         let mut res = (ProtocolResult::Continue, SessionResult::Continue);
 
         match self.protocol {
-            Some(State::Pipe(ref mut pipe)) => res.1 = pipe.back_writable(&mut self.metrics),
+            Some(State::Pipe(ref mut pipe)) => res.1 = pipe.backend_writable(&mut self.metrics),
             Some(State::RelayProxyProtocol(ref mut pp)) => {
                 res = pp.back_writable(&mut self.metrics);
             }
@@ -1044,13 +1044,13 @@ impl ProxySession for Session {
             State::ExpectProxyProtocol(ref expect) => &expect.readiness,
             State::SendProxyProtocol(ref send) => &send.front_readiness,
             State::RelayProxyProtocol(ref relay) => &relay.front_readiness,
-            State::Pipe(ref pipe) => &pipe.front_readiness,
+            State::Pipe(ref pipe) => &pipe.frontend_readiness,
         };
 
         let rb = match *unwrap_msg!(self.protocol.as_ref()) {
             State::SendProxyProtocol(ref send) => Some(&send.back_readiness),
             State::RelayProxyProtocol(ref relay) => Some(&relay.back_readiness),
-            State::Pipe(ref pipe) => Some(&pipe.back_readiness),
+            State::Pipe(ref pipe) => Some(&pipe.backend_readiness),
             _ => None,
         };
 

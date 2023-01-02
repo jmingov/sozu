@@ -91,7 +91,7 @@ pub trait SessionState {
     /// it will call this method
     fn process_events(&mut self, token: Token, events: Ready);
     /// closes the state
-    fn close(&mut self, proxy: Rc<RefCell<dyn HttpProxyTrait>>, metrics: &mut SessionMetrics);
+    fn close(&mut self, _proxy: Rc<RefCell<dyn HttpProxyTrait>>, _metrics: &mut SessionMetrics) {}
     /// if a timeout associated with the session triggers, the event loop will
     /// call this method with the timeout's token
     fn timeout(&mut self, token: Token, metrics: &mut SessionMetrics) -> SessionResult;

@@ -209,8 +209,8 @@ impl<Front: SocketHandler + Read> RelayProxyProtocol<Front> {
             listener,
         );
 
-        pipe.front_readiness.event = self.front_readiness.event;
-        pipe.back_readiness.event = self.back_readiness.event;
+        pipe.frontend_readiness.event = self.front_readiness.event;
+        pipe.backend_readiness.event = self.back_readiness.event;
 
         if let Some(back_token) = self.backend_token {
             pipe.set_back_token(back_token);

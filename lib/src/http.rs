@@ -214,14 +214,14 @@ impl Session {
                     self.listener.clone(),
                 );
 
-                pipe.front_readiness.event = http.frontend_readiness.event;
-                pipe.back_readiness.event = http.backend_readiness.event;
+                pipe.frontend_readiness.event = http.frontend_readiness.event;
+                pipe.backend_readiness.event = http.backend_readiness.event;
                 http.frontend_timeout
                     .set_duration(self.frontend_timeout_duration);
                 http.backend_timeout
                     .set_duration(self.backend_timeout_duration);
-                pipe.front_timeout = Some(http.frontend_timeout);
-                pipe.back_timeout = Some(http.backend_timeout);
+                pipe.frontend_timeout = Some(http.frontend_timeout);
+                pipe.backend_timeout = Some(http.backend_timeout);
                 pipe.set_back_token(back_token);
                 //pipe.set_cluster_id(self.cluster_id.clone());
 
@@ -268,7 +268,7 @@ impl Session {
             }
             _ => {
                 self.protocol = Some(protocol);
-                true
+                false
             }
         }
     }
@@ -309,7 +309,6 @@ impl Session {
             _ => SessionResult::CloseSession,
         }
     }
-    */
 
     fn log_context(&self) -> String {
         match *unwrap_msg!(self.protocol.as_ref()) {
@@ -324,7 +323,6 @@ impl Session {
         }
     }
 
-    /*
     /// Read content from the frontend
     fn readable(&mut self) -> SessionResult {
         let (upgrade, result) = match *unwrap_msg!(self.protocol.as_mut()) {
@@ -414,7 +412,7 @@ impl Session {
     fn front_readiness(&mut self) -> &mut Readiness {
         match *unwrap_msg!(self.protocol.as_mut()) {
             State::Http(ref mut http) => &mut http.frontend_readiness,
-            State::WebSocket(ref mut pipe) => &mut pipe.front_readiness,
+            State::WebSocket(ref mut pipe) => &mut pipe.frontend_readiness,
             State::Expect(ref mut expect) => &mut expect.readiness,
         }
     }
@@ -553,8 +551,8 @@ impl ProxySession for Session {
 
         match &mut self.protocol {
             Some(State::Http(http)) => http.close(self.proxy.clone(), &mut self.metrics),
-            Some(State::WebSocket(ws)) => ws.close(),
-            Some(State::Expect(expect)) => {} // expect.close(),
+            Some(State::WebSocket(websocket)) => websocket.close(self.proxy.clone(), &mut self.metrics),
+            Some(State::Expect(_expect)) => {} // expect.close(),
             None => {}
         }
 
@@ -632,7 +630,14 @@ impl ProxySession for Session {
             Some(State::Http(http)) => {
                 http.ready(session.clone(), self.proxy.clone(), &mut self.metrics)
             }
-            _ => ProtocolResult::Continue,
+            Some(State::Expect(_expect)) => {
+                // expect.ready(session.clone(), self.proxy.clone(), &mut self.metrics)
+                todo!();
+            }
+            Some(State::WebSocket(websocket)) => {
+                websocket.ready(session.clone(), self.proxy.clone(), &mut self.metrics)
+            }
+            _ => unreachable!(),
         };
 
         match protocol_result {
@@ -643,7 +648,6 @@ impl ProxySession for Session {
             }
             ProtocolResult::Close => self.close(),
             ProtocolResult::Continue => {}
-            _ => (),
         }
 
         self.metrics.service_stop();
@@ -667,7 +671,7 @@ impl ProxySession for Session {
     fn print_state(&self) {
         let p: String = match &self.protocol {
             Some(State::Expect(_)) => String::from("Expect"),
-            Some(State::Http(h)) => h.print_state("HTTP"),
+            Some(State::Http(http)) => http.print_state("HTTP"),
             Some(State::WebSocket(_)) => String::from("WS"),
             None => String::from("None"),
         };
@@ -675,11 +679,11 @@ impl ProxySession for Session {
         let rf = match *unwrap_msg!(self.protocol.as_ref()) {
             State::Expect(ref expect) => &expect.readiness,
             State::Http(ref http) => &http.frontend_readiness,
-            State::WebSocket(ref pipe) => &pipe.front_readiness,
+            State::WebSocket(ref pipe) => &pipe.frontend_readiness,
         };
         let rb = match *unwrap_msg!(self.protocol.as_ref()) {
             State::Http(ref http) => Some(&http.backend_readiness),
-            State::WebSocket(ref pipe) => Some(&pipe.back_readiness),
+            State::WebSocket(ref pipe) => Some(&pipe.backend_readiness),
             _ => None,
         };
 
