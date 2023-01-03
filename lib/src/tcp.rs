@@ -273,9 +273,12 @@ impl Session {
             Some(State::Pipe(ref mut pipe)) => pipe.readable(&mut self.metrics),
             Some(State::RelayProxyProtocol(ref mut pp)) => pp.readable(&mut self.metrics),
             Some(State::ExpectProxyProtocol(ref mut pp)) => {
-                let res = pp.readable(&mut self.metrics);
-                should_upgrade_protocol = res.0;
-                res.1
+                should_upgrade_protocol = pp.readable(&mut self.metrics);
+                match should_upgrade_protocol {
+                    ProtocolResult::Upgrade => SessionResult::Continue,
+                    ProtocolResult::Continue => SessionResult::Continue,
+                    ProtocolResult::Close => SessionResult::CloseSession,
+                }
             }
             _ => SessionResult::Continue,
         };
@@ -1041,7 +1044,7 @@ impl ProxySession for Session {
         };
 
         let rf = match *unwrap_msg!(self.protocol.as_ref()) {
-            State::ExpectProxyProtocol(ref expect) => &expect.readiness,
+            State::ExpectProxyProtocol(ref expect) => &expect.frontend_readiness,
             State::SendProxyProtocol(ref send) => &send.front_readiness,
             State::RelayProxyProtocol(ref relay) => &relay.front_readiness,
             State::Pipe(ref pipe) => &pipe.frontend_readiness,

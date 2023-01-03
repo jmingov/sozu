@@ -167,7 +167,7 @@ impl SessionState for TlsHandshake {
         _session: Rc<RefCell<dyn crate::ProxySession>>,
         _proxy: Rc<RefCell<dyn crate::HttpProxyTrait>>,
         _metrics: &mut SessionMetrics,
-    ) -> super::ProtocolResult {
+    ) -> ProtocolResult {
         let mut counter = 0;
         let max_loop_iterations = 100000;
 
@@ -256,7 +256,7 @@ impl SessionState for TlsHandshake {
         todo!()
     }
 
-    fn shutting_down(&mut self) -> super::ProtocolResult {
+    fn shutting_down(&mut self) -> ProtocolResult {
         todo!()
     }
 }

@@ -745,7 +745,7 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
         _session: Rc<RefCell<dyn crate::ProxySession>>,
         _proxy: Rc<RefCell<dyn crate::HttpProxyTrait>>,
         metrics: &mut SessionMetrics,
-    ) -> super::ProtocolResult {
+    ) -> ProtocolResult {
         let mut counter = 0;
         let max_loop_iterations = 100000;
 
@@ -899,7 +899,7 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
         todo!()
     }
 
-    fn shutting_down(&mut self) -> super::ProtocolResult {
+    fn shutting_down(&mut self) -> ProtocolResult {
         todo!()
     }
 }

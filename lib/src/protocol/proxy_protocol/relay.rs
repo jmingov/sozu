@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    io::{Read, Write},
+    io::Write,
     rc::Rc,
 };
 
@@ -33,7 +33,7 @@ pub struct RelayProxyProtocol<Front: SocketHandler> {
     cursor_header: usize,
 }
 
-impl<Front: SocketHandler + Read> RelayProxyProtocol<Front> {
+impl<Front: SocketHandler> RelayProxyProtocol<Front> {
     pub fn new(
         frontend: Front,
         frontend_token: Token,
@@ -195,7 +195,8 @@ impl<Front: SocketHandler + Read> RelayProxyProtocol<Front> {
         let addr = self.front_socket().peer_addr().ok();
 
         let mut pipe = Pipe::new(
-            self.frontend.take(0).into_inner(),
+            // self.frontend.take(0).into_inner(), WHY?
+            self.frontend,
             self.frontend_token,
             self.request_id,
             None,

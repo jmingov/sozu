@@ -236,7 +236,7 @@ impl Session {
                     .map(|add| (add.destination(), add.source()))
                 {
                     Some((Some(public_address), Some(client_address))) => {
-                        let readiness = expect.readiness;
+                        let readiness = expect.frontend_readiness;
                         let mut http = Http::new(
                             self.answers.clone(),
                             self.listener.borrow().config.back_timeout,
@@ -413,7 +413,7 @@ impl Session {
         match *unwrap_msg!(self.protocol.as_mut()) {
             State::Http(ref mut http) => &mut http.frontend_readiness,
             State::WebSocket(ref mut pipe) => &mut pipe.frontend_readiness,
-            State::Expect(ref mut expect) => &mut expect.readiness,
+            State::Expect(ref mut expect) => &mut expect.frontend_readiness,
         }
     }
 
@@ -625,14 +625,13 @@ impl ProxySession for Session {
 
     fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) {
         self.metrics.service_start();
-
+        
         let protocol_result = match &mut self.protocol {
             Some(State::Http(http)) => {
                 http.ready(session.clone(), self.proxy.clone(), &mut self.metrics)
             }
-            Some(State::Expect(_expect)) => {
-                // expect.ready(session.clone(), self.proxy.clone(), &mut self.metrics)
-                todo!();
+            Some(State::Expect(expect)) => {
+                expect.ready(session.clone(), self.proxy.clone(), &mut self.metrics)
             }
             Some(State::WebSocket(websocket)) => {
                 websocket.ready(session.clone(), self.proxy.clone(), &mut self.metrics)
@@ -677,7 +676,7 @@ impl ProxySession for Session {
         };
 
         let rf = match *unwrap_msg!(self.protocol.as_ref()) {
-            State::Expect(ref expect) => &expect.readiness,
+            State::Expect(ref expect) => &expect.frontend_readiness,
             State::Http(ref http) => &http.frontend_readiness,
             State::WebSocket(ref pipe) => &pipe.frontend_readiness,
         };

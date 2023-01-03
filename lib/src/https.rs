@@ -234,7 +234,7 @@ impl Session {
 
                 let ExpectProxyProtocol {
                     frontend,
-                    readiness,
+                    frontend_readiness: readiness,
                     request_id,
                     ..
                 } = expect;
@@ -719,7 +719,7 @@ impl Session {
     fn front_readiness(&mut self) -> &mut Readiness {
         match self.protocol {
             State::Invalid => unreachable!(),
-            State::Expect(ref mut expect, _) => &mut expect.readiness,
+            State::Expect(ref mut expect, _) => &mut expect.frontend_readiness,
             State::Handshake(ref mut handshake) => &mut handshake.frontend_readiness,
             State::Http(ref mut http) => http.frontend_readiness(),
             State::WebSocket(ref mut pipe) => &mut pipe.frontend_readiness,
@@ -1584,7 +1584,7 @@ impl ProxySession for Session {
 
         let front_readiness = match self.protocol {
             State::Invalid => unreachable!(),
-            State::Expect(ref expect, _) => &expect.readiness,
+            State::Expect(ref expect, _) => &expect.frontend_readiness,
             State::Handshake(ref handshake) => &handshake.frontend_readiness,
             State::Http(ref http) => &http.frontend_readiness,
             State::Http2(_) => todo!(),

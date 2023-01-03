@@ -30,7 +30,7 @@ pub struct SendProxyProtocol<Front: SocketHandler> {
     cursor_header: usize,
 }
 
-impl<Front: SocketHandler + Read> SendProxyProtocol<Front> {
+impl<Front: SocketHandler> SendProxyProtocol<Front> {
     pub fn new(
         frontend: Front,
         frontend_token: Token,
