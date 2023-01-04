@@ -1,12 +1,12 @@
-use std::{io::ErrorKind, rc::Rc, cell::RefCell};
+use std::{cell::RefCell, io::ErrorKind, rc::Rc};
 
 use mio::{net::*, Token};
 use rustls::ServerConnection;
 use rusty_ulid::Ulid;
 
-use crate::{protocol::ProtocolResult, Readiness, Ready, SessionResult, SessionMetrics};
+use crate::{protocol::ProtocolResult, Readiness, Ready, SessionMetrics, SessionResult};
 
-use super::{SessionState, http::LogContext};
+use super::{http::LogContext, SessionState};
 
 pub enum TlsState {
     Initial,
@@ -24,7 +24,12 @@ pub struct TlsHandshake {
 }
 
 impl TlsHandshake {
-    pub fn new(session: ServerConnection, stream: TcpStream, frontend_token: Token, request_id: Ulid) -> TlsHandshake {
+    pub fn new(
+        session: ServerConnection,
+        stream: TcpStream,
+        frontend_token: Token,
+        request_id: Ulid,
+    ) -> TlsHandshake {
         TlsHandshake {
             stream,
             session,

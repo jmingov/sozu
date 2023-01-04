@@ -68,8 +68,8 @@ pub enum State {
 pub struct Session {
     answers: Rc<RefCell<HttpAnswers>>,
     backend_timeout_duration: Duration,
-    front_timeout: TimeoutContainer,
     frontend_timeout_duration: Duration,
+    frontend_timeout: TimeoutContainer,
     frontend_token: Token,
     last_event: Instant,
     listener: Rc<RefCell<Listener>>,
@@ -138,7 +138,7 @@ impl Session {
             metrics,
             sticky_name,
             last_event: Instant::now(),
-            front_timeout,
+            frontend_timeout: front_timeout,
             listener_token,
             answers,
             frontend_timeout_duration,
@@ -243,7 +243,7 @@ impl Session {
                             self.listener.borrow().config.connect_timeout,
                             expect.frontend,
                             self.frontend_timeout_duration,
-                            self.front_timeout.take(),
+                            self.frontend_timeout.take(),
                             expect.frontend_token,
                             self.listener.clone(),
                             self.pool.clone(),
@@ -523,7 +523,7 @@ impl Session {
     */
 
     fn cancel_timeouts(&mut self) {
-        self.front_timeout.cancel();
+        self.frontend_timeout.cancel();
 
         match *unwrap_msg!(self.protocol.as_mut()) {
             State::Http(ref mut http) => http.cancel_timeouts(),
@@ -551,9 +551,7 @@ impl ProxySession for Session {
 
         match &mut self.protocol {
             Some(State::Http(http)) => http.close(self.proxy.clone(), &mut self.metrics),
-            Some(State::WebSocket(websocket)) => websocket.close(self.proxy.clone(), &mut self.metrics),
-            Some(State::Expect(_expect)) => {} // expect.close(),
-            None => {}
+            _ => {}
         }
 
         /*
@@ -590,7 +588,7 @@ impl ProxySession for Session {
         let res = match *unwrap_msg!(self.protocol.as_mut()) {
             State::Expect(_) => {
                 if token == self.frontend_token {
-                    self.front_timeout.triggered();
+                    self.frontend_timeout.triggered();
                 }
                 SessionResult::CloseSession
             }
@@ -625,7 +623,7 @@ impl ProxySession for Session {
 
     fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) {
         self.metrics.service_start();
-        
+
         let protocol_result = match &mut self.protocol {
             Some(State::Http(http)) => {
                 http.ready(session.clone(), self.proxy.clone(), &mut self.metrics)

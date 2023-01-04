@@ -1547,10 +1547,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
     }
 
     // Read content from cluster
-    pub fn backend_readable(
-        &mut self,
-        metrics: &mut SessionMetrics,
-    ) -> SessionResult {
+    pub fn backend_readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         if !self.backend_timeout.reset() {
             error!(
                 "could not reset back timeout {:?}:\n{}",
@@ -2477,7 +2474,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
 
             if backend_interest.is_writable() {
                 match self.backend_writable(metrics) {
-                    ProtocolResult::Continue => {},
+                    ProtocolResult::Continue => {}
                     ProtocolResult::Upgrade => return SessionResult::Upgrade,
                     ProtocolResult::Close => return SessionResult::CloseSession,
                 }

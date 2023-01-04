@@ -101,8 +101,8 @@ pub enum AlpnProtocols {
 pub struct Session {
     answers: Rc<RefCell<HttpAnswers>>,
     backend_timeout_duration: Duration,
-    front_timeout: TimeoutContainer,
     frontend_timeout_duration: Duration,
+    frontend_timeout: TimeoutContainer,
     pub frontend_token: Token,
     last_event: Instant,
     pub listener: Rc<RefCell<Listener>>,
@@ -175,7 +175,7 @@ impl Session {
             listener_token,
             peer_address,
             answers,
-            front_timeout,
+            frontend_timeout: front_timeout,
             frontend_timeout_duration,
             backend_timeout_duration,
             listener,
@@ -304,7 +304,7 @@ impl Session {
                     self.listener.borrow().config.connect_timeout,
                     front_stream,
                     self.frontend_timeout_duration,
-                    self.front_timeout.take(),
+                    self.frontend_timeout.take(),
                     // self.backend_timeout_duration,
                     self.frontend_token,
                     self.listener.clone(),
@@ -776,7 +776,7 @@ impl Session {
     */
 
     fn cancel_timeouts(&mut self) {
-        self.front_timeout.cancel();
+        self.frontend_timeout.cancel();
 
         match self.protocol {
             State::Invalid => unreachable!(),
@@ -1486,13 +1486,13 @@ impl ProxySession for Session {
             State::Invalid => unreachable!(),
             State::Expect(_, _) => {
                 if token == self.frontend_token {
-                    self.front_timeout.triggered();
+                    self.frontend_timeout.triggered();
                 }
                 SessionResult::CloseSession
             }
             State::Handshake(_) => {
                 if token == self.frontend_token {
-                    self.front_timeout.triggered();
+                    self.frontend_timeout.triggered();
                 }
                 SessionResult::CloseSession
             }
@@ -1532,7 +1532,9 @@ impl ProxySession for Session {
         let protocol_result = match &mut self.protocol {
             State::Invalid => unreachable!(),
             State::Http(http) => http.ready(session.clone(), self.proxy.clone(), &mut self.metrics),
-            State::Expect(expect, _) => expect.ready(session.clone(), self.proxy.clone(), &mut self.metrics),
+            State::Expect(expect, _) => {
+                expect.ready(session.clone(), self.proxy.clone(), &mut self.metrics)
+            }
             State::Handshake(handshake) => {
                 handshake.ready(session.clone(), self.proxy.clone(), &mut self.metrics)
             }

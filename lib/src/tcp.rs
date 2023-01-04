@@ -59,25 +59,25 @@ pub enum State {
 }
 
 pub struct Session {
-    backend: Option<Rc<RefCell<Backend>>>,
-    frontend_token: Token,
-    backend_token: Option<Token>,
-    back_connected: BackendConnectionStatus,
     accept_token: Token,
-    request_id: Ulid,
-    cluster_id: Option<String>,
+    backend_buffer: Option<Checkout>,
+    backend_connected: BackendConnectionStatus,
     backend_id: Option<String>,
-    metrics: SessionMetrics,
-    protocol: Option<State>,
-    front_buf: Option<Checkout>,
-    back_buf: Option<Checkout>,
-    last_event: Instant,
+    backend_timeout: TimeoutContainer,
+    backend_token: Option<Token>,
+    backend: Option<Rc<RefCell<Backend>>>,
+    cluster_id: Option<String>,
     connection_attempt: u8,
     frontend_address: Option<SocketAddr>,
-    front_timeout: TimeoutContainer,
-    back_timeout: TimeoutContainer,
-    proxy: Rc<RefCell<Proxy>>,
+    frontend_buffer: Option<Checkout>,
+    frontend_timeout: TimeoutContainer,
+    frontend_token: Token,
+    last_event: Instant,
     listener: Rc<RefCell<Listener>>,
+    metrics: SessionMetrics,
+    protocol: Option<State>,
+    proxy: Rc<RefCell<Proxy>>,
+    request_id: Ulid,
 }
 
 impl Session {
@@ -165,20 +165,20 @@ impl Session {
             backend: None,
             frontend_token,
             backend_token: None,
-            back_connected: BackendConnectionStatus::NotConnected,
+            backend_connected: BackendConnectionStatus::NotConnected,
             accept_token,
             request_id,
             cluster_id,
             backend_id,
             metrics,
             protocol,
-            front_buf: frontend_buffer,
-            back_buf: backend_buffer,
+            frontend_buffer,
+            backend_buffer,
             last_event: Instant::now(),
             connection_attempt: 0,
             frontend_address,
-            front_timeout,
-            back_timeout,
+            frontend_timeout: front_timeout,
+            backend_timeout: back_timeout,
             proxy,
             listener,
         }
@@ -263,7 +263,7 @@ impl Session {
     }
 
     fn readable(&mut self) -> SessionResult {
-        if !self.front_timeout.reset() {
+        if !self.frontend_timeout.reset() {
             error!("could not reset front timeout");
         }
 
@@ -302,7 +302,7 @@ impl Session {
     }
 
     fn back_readable(&mut self) -> SessionResult {
-        if !self.back_timeout.reset() {
+        if !self.backend_timeout.reset() {
             error!("could not reset back timeout");
         }
 
@@ -357,10 +357,10 @@ impl Session {
         let protocol = self.protocol.take();
 
         if let Some(State::SendProxyProtocol(pp)) = protocol {
-            if self.back_buf.is_some() && self.front_buf.is_some() {
+            if self.backend_buffer.is_some() && self.frontend_buffer.is_some() {
                 let mut pipe = pp.into_pipe(
-                    self.front_buf.take().unwrap(),
-                    self.back_buf.take().unwrap(),
+                    self.frontend_buffer.take().unwrap(),
+                    self.backend_buffer.take().unwrap(),
                     self.listener.clone(),
                 );
                 pipe.set_cluster_id(self.cluster_id.clone());
@@ -373,8 +373,8 @@ impl Session {
                 UpgradeResult::Close
             }
         } else if let Some(State::RelayProxyProtocol(pp)) = protocol {
-            if self.back_buf.is_some() {
-                let mut pipe = pp.into_pipe(self.back_buf.take().unwrap(), self.listener.clone());
+            if self.backend_buffer.is_some() {
+                let mut pipe = pp.into_pipe(self.backend_buffer.take().unwrap(), self.listener.clone());
                 pipe.set_cluster_id(self.cluster_id.clone());
                 self.protocol = Some(State::Pipe(pipe));
                 gauge_add!("protocol.proxy.relay", -1);
@@ -385,10 +385,10 @@ impl Session {
                 UpgradeResult::Close
             }
         } else if let Some(State::ExpectProxyProtocol(pp)) = protocol {
-            if self.front_buf.is_some() && self.back_buf.is_some() {
+            if self.frontend_buffer.is_some() && self.backend_buffer.is_some() {
                 let mut pipe = pp.into_pipe(
-                    self.front_buf.take().unwrap(),
-                    self.back_buf.take().unwrap(),
+                    self.frontend_buffer.take().unwrap(),
+                    self.backend_buffer.take().unwrap(),
                     None,
                     None,
                     self.listener.clone(),
@@ -469,12 +469,12 @@ impl Session {
     }
 
     fn back_connected(&self) -> BackendConnectionStatus {
-        self.back_connected
+        self.backend_connected
     }
 
     fn set_back_connected(&mut self, status: BackendConnectionStatus) {
-        let last = self.back_connected;
-        self.back_connected = status;
+        let last = self.backend_connected;
+        self.backend_connected = status;
 
         if status == BackendConnectionStatus::Connected {
             gauge_add!("backend.connections", 1);
@@ -583,8 +583,8 @@ impl Session {
     }
 
     pub fn cancel_timeouts(&mut self) {
-        self.front_timeout.cancel();
-        self.back_timeout.cancel();
+        self.frontend_timeout.cancel();
+        self.backend_timeout.cancel();
     }
 
     fn ready_inner(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionResult {
@@ -616,8 +616,10 @@ impl Session {
             } else if self.back_readiness().unwrap().event != Ready::empty() {
                 self.reset_connection_attempt();
                 let back_token = self.backend_token.unwrap();
-                self.back_timeout.set(back_token);
-                self.back_connected = BackendConnectionStatus::Connecting(Instant::now());
+                self.backend_timeout.set(back_token);
+                // Why is this here? this artificially reset the connection time for no apparent reasons
+                // TODO: maybe remove this?
+                self.backend_connected = BackendConnectionStatus::Connecting(Instant::now());
 
                 self.set_back_connected(BackendConnectionStatus::Connected);
             }
@@ -899,7 +901,7 @@ impl Session {
                 stream, e
             );
         }
-        self.back_connected = BackendConnectionStatus::Connecting(Instant::now());
+        self.backend_connected = BackendConnectionStatus::Connecting(Instant::now());
 
         let back_token = {
             let proxy = self.proxy.borrow();
@@ -924,8 +926,8 @@ impl Session {
                 .config
                 .connect_timeout as i64,
         );
-        self.back_timeout.set_duration(connect_timeout_duration);
-        self.back_timeout.set(back_token);
+        self.backend_timeout.set_duration(connect_timeout_duration);
+        self.backend_timeout.set(back_token);
 
         self.set_back_token(back_token);
         self.set_back_socket(stream);
@@ -978,7 +980,7 @@ impl ProxySession for Session {
     fn timeout(&mut self, token: Token) {
         if self.frontend_token == token {
             let dur = Instant::now() - self.last_event;
-            let front_timeout = self.front_timeout.duration();
+            let front_timeout = self.frontend_timeout.duration();
             if dur < front_timeout {
                 TIMER.with(|timer| {
                     timer.borrow_mut().set_timeout(front_timeout - dur, token);
@@ -1058,7 +1060,7 @@ impl ProxySession for Session {
         };
 
         error!("zombie session[{:?} => {:?}], state => readiness: {:?} -> {:?}, protocol: {}, cluster_id: {:?}, back_connected: {:?}, metrics: {:?}",
-            self.frontend_token, self.backend_token, rf, rb, p, self.cluster_id, self.back_connected, self.metrics
+            self.frontend_token, self.backend_token, rf, rb, p, self.cluster_id, self.backend_connected, self.metrics
         );
     }
 

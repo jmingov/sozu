@@ -6,7 +6,7 @@ use rusty_ulid::Ulid;
 
 use crate::{
     pool::Checkout,
-    protocol::{pipe::Pipe, http::LogContext},
+    protocol::{http::LogContext, pipe::Pipe},
     protocol::{ProtocolResult, SessionState},
     socket::{SocketHandler, SocketResult},
     sozu_command::ready::Ready,
@@ -287,7 +287,6 @@ impl<Front: SocketHandler> SessionState for ExpectProxyProtocol<Front> {
         todo!()
     }
 }
-
 
 #[cfg(test)]
 mod expect_test {

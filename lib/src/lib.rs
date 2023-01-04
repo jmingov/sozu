@@ -554,7 +554,7 @@ impl Backend {
 
     pub fn try_connect(&mut self) -> anyhow::Result<mio::net::TcpStream> {
         if self.status != BackendStatus::Normal {
-            bail!("This backend as not a normal status");
+            bail!("This backend is not in a normal status");
         }
 
         match mio::net::TcpStream::connect(self.address) {

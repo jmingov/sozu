@@ -197,10 +197,10 @@ pub fn begin_worker_process(
 }
 
 /// unix-forks the main process
-/// 
+///
 /// - Parent: sends config and listeners to the new worker
 /// - Child: calls the sozu executable path like so: `sozu worker --id <worker_id> [...]`
-/// 
+///
 /// returns the child process pid, and channels to talk to it.
 pub fn fork_main_into_worker(
     worker_id: &str,
