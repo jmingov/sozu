@@ -1383,7 +1383,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
     }
 
     // Forward content to cluster
-    pub fn backend_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+    pub fn backend_writable(&mut self, metrics: &mut SessionMetrics) -> ProtocolResult {
         if let SessionStatus::DefaultAnswer(_, _, _) = self.status {
             error!(
                 "{}\tsending default answer, should not write to back",
@@ -1391,7 +1391,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
             );
             self.backend_readiness.interest.remove(Ready::writable());
             self.frontend_readiness.interest.insert(Ready::writable());
-            return SessionResult::Continue;
+            return ProtocolResult::Continue;
         }
 
         if self
@@ -1402,14 +1402,14 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
         {
             self.frontend_readiness.interest.insert(Ready::readable());
             self.backend_readiness.interest.remove(Ready::writable());
-            return SessionResult::Continue;
+            return ProtocolResult::Continue;
         }
 
         let tokens = self.tokens();
         let output_size = self.frontend_buffer.as_ref().unwrap().output_data_size();
         if self.backend_socket.is_none() {
             self.log_request_error(metrics, "back socket not found, closing connection");
-            return SessionResult::CloseSession;
+            return ProtocolResult::Close;
         }
 
         let mut sz = 0usize;
@@ -1431,7 +1431,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                     self.frontend_readiness.interest.insert(Ready::readable());
                     self.backend_readiness.interest.remove(Ready::writable());
                     metrics.backend_bout += sz;
-                    return SessionResult::Continue;
+                    return ProtocolResult::Continue;
                 }
                 /*
                 let (current_sz, current_res) = sock.socket_write(self.frontend_buf.as_ref().unwrap().next_output_data());
@@ -1477,7 +1477,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                 self.frontend_readiness.interest.remove(Ready::readable());
                 self.backend_readiness.interest.insert(Ready::readable());
                 self.backend_readiness.interest.remove(Ready::writable());
-                return SessionResult::Continue;
+                return ProtocolResult::Continue;
             }
             SocketResult::WouldBlock => {
                 self.backend_readiness.event.remove(Ready::writable());
@@ -1508,24 +1508,23 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                     if let Some(token) = self.backend_token.as_ref() {
                         self.backend_timeout.set(*token);
                     }
-                    SessionResult::Continue
+                    ProtocolResult::Continue
                 }
                 Some(RequestState::RequestWithBodyChunks(_, _, _, Chunk::Initial)) => {
                     if !self.must_continue_request() {
                         self.frontend_readiness.interest.insert(Ready::readable());
-                        SessionResult::Continue
                     } else {
                         // wait for the 100 continue response from the backend
                         // keep the front buffer
                         self.frontend_readiness.interest.remove(Ready::readable());
                         self.backend_readiness.interest.insert(Ready::readable());
                         self.backend_readiness.interest.remove(Ready::writable());
-                        SessionResult::Continue
                     }
+                    ProtocolResult::Continue
                 }
                 Some(RequestState::RequestWithBodyChunks(_, _, _, _)) => {
                     self.frontend_readiness.interest.insert(Ready::readable());
-                    SessionResult::Continue
+                    ProtocolResult::Continue
                 }
                 //we're not done parsing the headers
                 Some(RequestState::HasRequestLine(_, _))
@@ -1533,17 +1532,17 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                 | Some(RequestState::HasLength(_, _, _))
                 | Some(RequestState::HasHostAndLength(_, _, _, _)) => {
                     self.frontend_readiness.interest.insert(Ready::readable());
-                    SessionResult::Continue
+                    ProtocolResult::Continue
                 }
                 _ => {
                     self.log_request_error(metrics, "invalid state, closing connection");
-                    SessionResult::CloseSession
+                    ProtocolResult::Close
                 }
             }
         } else {
             self.frontend_readiness.interest.insert(Ready::readable());
             self.backend_readiness.interest.insert(Ready::writable());
-            SessionResult::Continue
+            ProtocolResult::Continue
         }
     }
 
@@ -1551,7 +1550,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
     pub fn backend_readable(
         &mut self,
         metrics: &mut SessionMetrics,
-    ) -> (ProtocolResult, SessionResult) {
+    ) -> SessionResult {
         if !self.backend_timeout.reset() {
             error!(
                 "could not reset back timeout {:?}:\n{}",
@@ -1566,7 +1565,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                 self.log_context()
             );
             self.backend_readiness.interest.remove(Ready::readable());
-            return (ProtocolResult::Continue, SessionResult::Continue);
+            return SessionResult::Continue;
         }
 
         if self.backend_buffer.is_none() {
@@ -1577,7 +1576,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                     }
                     None => {
                         error!("cannot get back buffer from pool, closing");
-                        return (ProtocolResult::Continue, SessionResult::CloseSession);
+                        return SessionResult::CloseSession;
                     }
                 }
             }
@@ -1592,14 +1591,14 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
             == 0
         {
             self.backend_readiness.interest.remove(Ready::readable());
-            return (ProtocolResult::Continue, SessionResult::Continue);
+            return SessionResult::Continue;
         }
 
         let tokens = self.tokens();
 
         if self.backend_socket.is_none() {
             self.log_request_error(metrics, "back socket not found, closing connection");
-            return (ProtocolResult::Continue, SessionResult::CloseSession);
+            return SessionResult::CloseSession;
         }
 
         let (sz, socket_state) = {
@@ -1630,7 +1629,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
 
         if socket_state == SocketResult::Error {
             self.log_request_error(metrics, "back socket read error, closing connection");
-            return (ProtocolResult::Continue, SessionResult::CloseSession);
+            return SessionResult::CloseSession;
         }
 
         // isolate that here because the "ref protocol" and the self.state = " make borrowing conflicts
@@ -1639,10 +1638,10 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
             if compare_no_case(protocol.as_bytes(), "websocket".as_bytes()) {
                 self.frontend_timeout.reset();
                 self.backend_timeout.reset();
-                return (ProtocolResult::Upgrade, SessionResult::Continue);
+                return SessionResult::Upgrade;
             } else {
                 //FIXME: should we upgrade to a pipe or send an error?
-                return (ProtocolResult::Continue, SessionResult::Continue);
+                return SessionResult::Continue;
             }
         }
 
@@ -1652,7 +1651,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                     metrics,
                     "should not go back in backend_readable if the whole response was parsed",
                 );
-                (ProtocolResult::Continue, SessionResult::CloseSession)
+                SessionResult::CloseSession
             }
             Some(ResponseState::ResponseWithBody(_, _, _)) => {
                 self.frontend_readiness.interest.insert(Ready::writable());
@@ -1661,13 +1660,13 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                     self.backend_stop = Some(Instant::now());
                     self.backend_readiness.interest.remove(Ready::readable());
                 }
-                (ProtocolResult::Continue, SessionResult::Continue)
+                SessionResult::Continue
             }
             Some(ResponseState::ResponseWithBodyChunks(_, _, Chunk::Ended)) => {
                 use nom::HexDisplay;
                 self.backend_readiness.interest.remove(Ready::readable());
                 match sz {
-                    0 => (ProtocolResult::Continue, SessionResult::Continue),
+                    0 => SessionResult::Continue,
                     _ => {
                         error!(
                             "{}\tback read should have stopped on chunk ended\nreq: {:?} res:{:?}\ndata:{}",
@@ -1678,13 +1677,13 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                             metrics,
                             "back read should have stopped on chunk ended",
                         );
-                        (ProtocolResult::Continue, SessionResult::CloseSession)
+                        SessionResult::CloseSession
                     }
                 }
             }
             Some(ResponseState::ResponseWithBodyChunks(_, _, Chunk::Error)) => {
                 self.log_request_error(metrics, "back read should have stopped on chunk error");
-                (ProtocolResult::Continue, SessionResult::CloseSession)
+                SessionResult::CloseSession
             }
             Some(ResponseState::ResponseWithBodyChunks(_, _, _)) => {
                 if !self.backend_buffer.as_ref().unwrap().needs_input() {
@@ -1726,7 +1725,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                             metrics,
                             "back socket chunk parse error, closing connection",
                         );
-                        return (ProtocolResult::Continue, SessionResult::CloseSession);
+                        return SessionResult::CloseSession;
                     }
 
                     if let Some(ResponseState::ResponseWithBodyChunks(_, _, Chunk::Ended)) =
@@ -1738,7 +1737,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                     }
                 }
                 self.frontend_readiness.interest.insert(Ready::writable());
-                (ProtocolResult::Continue, SessionResult::Continue)
+                SessionResult::Continue
             }
             Some(ResponseState::ResponseWithBodyCloseDelimited(_, _, _)) => {
                 self.frontend_readiness.interest.insert(Ready::writable());
@@ -1771,7 +1770,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                         {
                             save_http_status_metric(self.get_response_status());
                             self.log_request_success(metrics);
-                            return (ProtocolResult::Continue, SessionResult::CloseSession);
+                            return SessionResult::CloseSession;
                         }
                     } else {
                         self.response_state = Some(ResponseState::ResponseWithBodyCloseDelimited(
@@ -1782,7 +1781,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                     }
                 }
 
-                (ProtocolResult::Continue, SessionResult::Continue)
+                SessionResult::Continue
             }
             Some(ResponseState::Error(_, _, _, _, _)) => panic!(
                 "{}\tback read should have stopped on responsestate error",
@@ -1834,7 +1833,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
 
                 if unwrap_msg!(self.response_state.as_ref()).is_back_error() {
                     self.set_answer(DefaultAnswerStatus::Answer502, None);
-                    return (ProtocolResult::Continue, self.writable(metrics));
+                    return self.writable(metrics);
                 }
 
                 if let Some(ResponseState::Response(_, _)) = self.response_state {
@@ -1850,15 +1849,15 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                     if compare_no_case(protocol.as_bytes(), "websocket".as_bytes()) {
                         self.frontend_timeout.reset();
                         self.backend_timeout.reset();
-                        return (ProtocolResult::Upgrade, SessionResult::Continue);
+                        return SessionResult::Upgrade;
                     }
 
                     //FIXME: should we upgrade to a pipe or send an error?
-                    return (ProtocolResult::Continue, SessionResult::Continue);
+                    return SessionResult::Continue;
                 }
 
                 self.frontend_readiness.interest.insert(Ready::writable());
-                (ProtocolResult::Continue, SessionResult::Continue)
+                SessionResult::Continue
             }
         }
     }
@@ -2458,7 +2457,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                 );
 
                 match session_result {
-                    // TODO: verify ReconnectBackend makes sense here
+                    SessionResult::Continue => {}
                     SessionResult::ConnectBackend => {
                         match self.connect_to_backend(session.clone(), proxy.clone(), metrics) {
                             // reuse connection or send a default answer, we can continue
@@ -2472,25 +2471,20 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                             }
                         }
                     }
-                    SessionResult::Continue => {}
                     other => return other,
                 }
             }
 
             if backend_interest.is_writable() {
-                let session_result = self.backend_writable(metrics);
-                if session_result != SessionResult::Continue {
-                    return session_result;
+                match self.backend_writable(metrics) {
+                    ProtocolResult::Continue => {},
+                    ProtocolResult::Upgrade => return SessionResult::Upgrade,
+                    ProtocolResult::Close => return SessionResult::CloseSession,
                 }
             }
 
             if backend_interest.is_readable() {
-                let (protocol_result, session_result) = self.backend_readable(metrics);
-
-                if protocol_result == ProtocolResult::Upgrade {
-                    return SessionResult::Upgrade;
-                }
-
+                let session_result = self.backend_readable(metrics);
                 if session_result != SessionResult::Continue {
                     return session_result;
                 }
@@ -2511,11 +2505,11 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
             if backend_interest.is_hup() {
                 let session_result = self.backend_hup();
                 match session_result {
-                    SessionResult::CloseSession | SessionResult::CloseBackend => {
-                        return session_result;
-                    }
                     SessionResult::Continue => {
                         continue;
+                    }
+                    SessionResult::CloseSession | SessionResult::CloseBackend => {
+                        return session_result;
                     }
                     _ => {
                         self.backend_readiness.event.remove(Ready::hup());
@@ -2602,14 +2596,12 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> SessionStat
     ) -> ProtocolResult {
         match self.ready_inner(session, proxy.clone(), metrics) {
             SessionResult::CloseSession => ProtocolResult::Close,
+            SessionResult::Upgrade => ProtocolResult::Upgrade,
             SessionResult::CloseBackend => {
                 self.close_backend(proxy, metrics);
-                ProtocolResult::Continue
+                ProtocolResult::Close
             }
-            SessionResult::Continue => ProtocolResult::Continue,
-            SessionResult::Upgrade => ProtocolResult::Upgrade,
-            SessionResult::ReconnectBackend => todo!(),
-            SessionResult::ConnectBackend => unreachable!(),
+            _ => ProtocolResult::Continue,
         }
     }
 

@@ -62,7 +62,7 @@ use std::rc::Rc;
 use mio::Token;
 use sozu_command::ready::Ready;
 
-use crate::{ProxySession, SessionMetrics, SessionResult, HttpProxyTrait};
+use crate::{HttpProxyTrait, ProxySession, SessionMetrics, SessionResult};
 
 pub use self::http::{Http, StickySession};
 pub use self::pipe::Pipe;
@@ -100,5 +100,7 @@ pub trait SessionState {
     /// list the tokens associated with the session
     fn tokens(&self) -> Vec<Token>;
     /// tells the state to shut down if possible
-    fn shutting_down(&mut self) -> ProtocolResult;
+    fn shutting_down(&mut self) -> ProtocolResult {
+        ProtocolResult::Close
+    }
 }

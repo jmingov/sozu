@@ -438,7 +438,7 @@ impl RequiredEvents {
 pub enum SessionResult {
     CloseSession,
     CloseBackend,
-    ReconnectBackend,
+    // ReconnectBackend, seems unused
     Continue,
     ConnectBackend,
     Upgrade,

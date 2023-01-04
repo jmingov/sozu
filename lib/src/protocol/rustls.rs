@@ -255,8 +255,4 @@ impl SessionState for TlsHandshake {
     fn tokens(&self) -> Vec<Token> {
         todo!()
     }
-
-    fn shutting_down(&mut self) -> ProtocolResult {
-        todo!()
-    }
 }

@@ -286,10 +286,6 @@ impl<Front: SocketHandler> SessionState for ExpectProxyProtocol<Front> {
     fn tokens(&self) -> Vec<Token> {
         todo!()
     }
-
-    fn shutting_down(&mut self) -> ProtocolResult {
-        todo!()
-    }
 }
 
 

@@ -898,10 +898,6 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
     fn tokens(&self) -> Vec<Token> {
         todo!()
     }
-
-    fn shutting_down(&mut self) -> ProtocolResult {
-        todo!()
-    }
 }
 
 impl<Front: SocketHandler, L: ListenerHandler> std::ops::Drop for Pipe<Front, L> {

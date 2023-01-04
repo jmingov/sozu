@@ -1532,7 +1532,7 @@ impl ProxySession for Session {
         let protocol_result = match &mut self.protocol {
             State::Invalid => unreachable!(),
             State::Http(http) => http.ready(session.clone(), self.proxy.clone(), &mut self.metrics),
-            State::Expect(_, _) => todo!(),
+            State::Expect(expect, _) => expect.ready(session.clone(), self.proxy.clone(), &mut self.metrics),
             State::Handshake(handshake) => {
                 handshake.ready(session.clone(), self.proxy.clone(), &mut self.metrics)
             }
@@ -1559,7 +1559,6 @@ impl ProxySession for Session {
         let session_result = match self.protocol {
             State::Invalid => unreachable!(),
             State::Http(ref mut http) => http.shutting_down(),
-            State::Handshake(_) => ProtocolResult::Continue,
             _ => ProtocolResult::Close,
         };
 
