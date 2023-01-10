@@ -52,7 +52,7 @@ fn main() -> anyhow::Result<()> {
             LoggerBackend::Stdout(stdout()),
             None,
         );
-        sozu::tcp::start(listener, max_buffers, buffer_size, channel);
+        sozu::tcp::start_tcp_worker(listener, max_buffers, buffer_size, channel);
     });
 
     let tcp_front = proxy::TcpFrontend {

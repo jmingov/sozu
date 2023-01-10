@@ -274,42 +274,6 @@ impl HttpSession {
     }
 
     /*
-    pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: Option<Rc<Vec<u8>>>) {
-        if let State::Http(ref mut http) = *unwrap_msg!(self.protocol.as_mut()) {
-            http.set_answer(answer, buf);
-        }
-    }
-
-    pub fn http(&self) -> Option<&Http<TcpStream, Listener>> {
-        self.protocol.as_ref().and_then(|protocol| match protocol {
-            State::Http(ref http) => Some(http),
-            _ => None,
-        })
-    }
-
-    pub fn http_mut(&mut self) -> Option<&mut Http<TcpStream, Listener>> {
-        self.protocol.as_mut().and_then(|protocol| match protocol {
-            State::Http(ref mut http) => Some(http),
-            _ => None,
-        })
-    }
-
-    fn front_hup(&mut self) -> SessionResult {
-        match *unwrap_msg!(self.protocol.as_mut()) {
-            State::Http(ref mut http) => http.front_hup(),
-            State::WebSocket(ref mut pipe) => pipe.front_hup(&mut self.metrics),
-            _ => SessionResult::CloseSession,
-        }
-    }
-
-    fn back_hup(&mut self) -> SessionResult {
-        match *unwrap_msg!(self.protocol.as_mut()) {
-            State::Http(ref mut http) => http.back_hup(),
-            State::WebSocket(ref mut pipe) => pipe.back_hup(&mut self.metrics),
-            _ => SessionResult::CloseSession,
-        }
-    }
-
     fn log_context(&self) -> String {
         match *unwrap_msg!(self.protocol.as_ref()) {
             State::Http(ref http) => {
@@ -321,83 +285,6 @@ impl HttpSession {
             }
             _ => "".to_string(),
         }
-    }
-
-    /// Read content from the frontend
-    fn readable(&mut self) -> SessionResult {
-        let (upgrade, result) = match *unwrap_msg!(self.protocol.as_mut()) {
-            State::Expect(ref mut expect) => {
-                if !self.front_timeout.reset() {
-                    error!("could not reset front timeout (HTTP upgrading from expect)");
-                }
-                expect.readable(&mut self.metrics)
-            }
-            State::Http(ref mut http) => {
-                (ProtocolResult::Continue, http.readable(&mut self.metrics))
-            }
-            State::WebSocket(ref mut pipe) => {
-                (ProtocolResult::Continue, pipe.readable(&mut self.metrics))
-            }
-        };
-
-        if upgrade == ProtocolResult::Continue {
-            return result;
-        }
-
-        if self.upgrade() {
-            return match *unwrap_msg!(self.protocol.as_mut()) {
-                State::Http(ref mut http) => http.readable(&mut self.metrics),
-                _ => result,
-            };
-        }
-
-        // currently, only happens in expect proxy protocol with AF_UNSPEC address
-        //error!("failed protocol upgrade");
-        SessionResult::CloseSession
-    }
-
-    // Forward content to the frontend
-    fn writable(&mut self) -> SessionResult {
-        match *unwrap_msg!(self.protocol.as_mut()) {
-            State::Http(ref mut http) => http.writable(&mut self.metrics),
-            State::WebSocket(ref mut pipe) => pipe.writable(&mut self.metrics),
-            State::Expect(_) => SessionResult::CloseSession,
-        }
-    }
-
-    // Forward content to cluster
-    fn back_writable(&mut self) -> SessionResult {
-        match *unwrap_msg!(self.protocol.as_mut()) {
-            State::Http(ref mut http) => http.back_writable(&mut self.metrics),
-            State::WebSocket(ref mut pipe) => pipe.back_writable(&mut self.metrics),
-            State::Expect(_) => SessionResult::CloseSession,
-        }
-    }
-
-    // Read content from cluster
-    fn back_readable(&mut self) -> SessionResult {
-        let (upgrade, result) = match *unwrap_msg!(self.protocol.as_mut()) {
-            State::Http(ref mut http) => http.back_readable(&mut self.metrics),
-            State::WebSocket(ref mut pipe) => (
-                ProtocolResult::Continue,
-                pipe.back_readable(&mut self.metrics),
-            ),
-            State::Expect(_) => return SessionResult::CloseSession,
-        };
-
-        if upgrade == ProtocolResult::Continue {
-            return result;
-        }
-
-        if self.upgrade() {
-            return match *unwrap_msg!(self.protocol.as_mut()) {
-                State::WebSocket(ref mut pipe) => pipe.back_readable(&mut self.metrics),
-                _ => result,
-            };
-        }
-
-        error!("failed protocol upgrade");
-        SessionResult::CloseSession
     }
     */
 
@@ -424,103 +311,6 @@ impl HttpSession {
             State::Expect(_) => vec![],
         }
     }
-
-    /*
-    fn back_socket_mut(&mut self) -> Option<&mut TcpStream> {
-        match *unwrap_msg!(self.protocol.as_mut()) {
-            State::Http(ref mut http) => http.back_socket_mut(),
-            State::WebSocket(ref mut pipe) => pipe.back_socket_mut(),
-            State::Expect(_) => None,
-        }
-    }
-
-    fn set_back_socket(&mut self, socket: TcpStream) {
-        match *unwrap_msg!(self.protocol.as_mut()) {
-            State::Http(ref mut http) => http.set_back_socket(socket, self.backend.clone()),
-            // not passing it here since we should already have a connection available
-            State::WebSocket(_) => {}
-            State::Expect(_) => {}
-        }
-    }
-
-    fn set_back_token(&mut self, token: Token) {
-        match *unwrap_msg!(self.protocol.as_mut()) {
-            State::Http(ref mut http) => http.set_back_token(token),
-            State::WebSocket(ref mut pipe) => pipe.set_back_token(token),
-            State::Expect(_) => {}
-        }
-    }
-
-    fn back_connected(&self) -> BackendConnectionStatus {
-        self.back_connected
-    }
-
-    fn set_back_connected(&mut self, connected: BackendConnectionStatus) {
-        let last = self.back_connected;
-        self.back_connected = connected;
-
-        if connected == BackendConnectionStatus::Connected {
-            gauge_add!("backend.connections", 1);
-            gauge_add!(
-                "connections_per_backend",
-                1,
-                self.cluster_id.as_deref(),
-                self.metrics.backend_id.as_deref()
-            );
-
-            // the back timeout was of connect_timeout duration before,
-            // now that we're connected, move to backend_timeout duration
-            let t = self.backend_timeout_duration;
-            if let Some(h) = self.http_mut() {
-                h.set_back_timeout(t);
-                h.cancel_backend_timeout();
-            }
-
-            if let Some(backend) = &self.backend {
-                let mut backend = backend.borrow_mut();
-
-                if backend.retry_policy.is_down() {
-                    incr!(
-                        "up",
-                        self.cluster_id.as_deref(),
-                        self.metrics.backend_id.as_deref()
-                    );
-
-                    info!(
-                        "backend server {} at {} is up",
-                        backend.backend_id, backend.address
-                    );
-
-                    push_event(ProxyEvent::BackendUp(
-                        backend.backend_id.clone(),
-                        backend.address,
-                    ));
-                }
-
-                if let BackendConnectionStatus::Connecting(start) = last {
-                    backend.set_connection_time(Instant::now() - start);
-                }
-
-                //successful connection, reset failure counter
-                backend.failures = 0;
-                backend.active_requests += 1;
-                backend.retry_policy.succeed();
-            }
-        }
-    }
-
-    fn metrics(&mut self) -> &mut SessionMetrics {
-        &mut self.metrics
-    }
-
-    fn back_readiness(&mut self) -> Option<&mut Readiness> {
-        match *unwrap_msg!(self.protocol.as_mut()) {
-            State::Http(ref mut http) => Some(&mut http.back_readiness),
-            State::WebSocket(ref mut pipe) => Some(&mut pipe.back_readiness),
-            _ => None,
-        }
-    }
-    */
 
     fn cancel_timeouts(&mut self) {
         self.frontend_timeout.cancel();
@@ -553,23 +343,6 @@ impl ProxySession for HttpSession {
             Some(State::Http(http)) => http.close(self.proxy.clone(), &mut self.metrics),
             _ => {}
         }
-
-        /*
-        match self.protocol {
-            Some(State::Http(ref mut http)) => {
-            }
-            Some(State::WebSocket(_)) => {
-                self.close_backend();
-                if let Some(b) = &self.backend {
-                    let mut backend = b.borrow_mut();
-                    backend.active_requests = backend.active_requests.saturating_sub(1);
-                }
-                gauge_add!("protocol.ws", -1)
-            }
-            Some(State::Expect(_)) => gauge_add!("protocol.proxy.expect", -1),
-            None => {}
-        }
-        */
 
         let fd = self.front_socket().as_raw_fd();
         let proxy = self.proxy.borrow();
@@ -1262,7 +1035,7 @@ impl HttpProxyTrait for HttpProxy {
 }
 
 /// This is not directly used by Sōzu but is available for example and testing purposes
-pub fn start(
+pub fn start_http_worker(
     config: HttpListenerConfig,
     channel: ProxyChannel,
     max_buffers: usize,
@@ -1409,7 +1182,7 @@ mod tests {
             Channel::generate(1000, 10000).expect("should create a channel");
         let _jg = thread::spawn(move || {
             setup_test_logger!();
-            start(config, channel, 10, 16384).expect("could not start the http server");
+            start_http_worker(config, channel, 10, 16384).expect("could not start the http server");
         });
 
         let front = HttpFrontend {
@@ -1497,7 +1270,7 @@ mod tests {
 
         let _jg = thread::spawn(move || {
             setup_test_logger!();
-            start(config, channel, 10, 16384).expect("could not start the http server");
+            start_http_worker(config, channel, 10, 16384).expect("could not start the http server");
         });
 
         let front = HttpFrontend {
@@ -1610,7 +1383,7 @@ mod tests {
             Channel::generate(1000, 10000).expect("should create a channel");
         let _jg = thread::spawn(move || {
             setup_test_logger!();
-            start(config, channel, 10, 16384).expect("could not start the http server");
+            start_http_worker(config, channel, 10, 16384).expect("could not start the http server");
         });
 
         let cluster = Cluster {

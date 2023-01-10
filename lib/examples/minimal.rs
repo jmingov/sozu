@@ -47,7 +47,7 @@ fn main() -> anyhow::Result<()> {
     let jg = thread::spawn(move || {
         let max_buffers = 500;
         let buffer_size = 16384;
-        sozu::http::start(config, channel, max_buffers, buffer_size);
+        sozu::http::start_http_worker(config, channel, max_buffers, buffer_size);
     });
 
     let http_front = proxy::HttpFrontend {

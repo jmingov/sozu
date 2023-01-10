@@ -1883,20 +1883,6 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
     }
 }
 
-/*
-
-
-
-
-
-
-
-
-
-
-
-*/
-
 impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front, L> {
     fn remove_backend(&mut self) {
         /*debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND",
@@ -2565,22 +2551,6 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
         SessionResult::Continue
     }
 }
-
-/*
-
-
-
-
-
-
-
-
-
-
-
-
-
-*/
 
 impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> SessionState
     for Http<Front, L>

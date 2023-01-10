@@ -51,7 +51,7 @@ fn test() {
         );
         let max_buffers = 20;
         let buffer_size = 16384;
-        sozu::http::start(config, channel, max_buffers, buffer_size);
+        sozu::http::start_http_worker(config, channel, max_buffers, buffer_size);
     });
 
     command.write_message(&proxy::ProxyRequest {

@@ -432,17 +432,6 @@ impl TcpSession {
         }
     }
 
-    // TODO: why did we have this AND self.backend_token? was it important?
-    // fn back_token(&self) -> Option<Token> {
-    //     match self.protocol {
-    //         Some(State::Pipe(ref pipe)) => pipe.back_token(),
-    //         Some(State::SendProxyProtocol(ref pp)) => pp.back_token(),
-    //         Some(State::RelayProxyProtocol(ref pp)) => pp.back_token(),
-    //         Some(State::ExpectProxyProtocol(_)) => None,
-    //         _ => unreachable!(),
-    //     }
-    // }
-
     fn set_back_socket(&mut self, socket: MioTcpStream) {
         match self.protocol {
             Some(State::Pipe(ref mut pipe)) => pipe.set_back_socket(socket),
@@ -1500,7 +1489,7 @@ impl ProxyConfiguration for TcpProxy {
 }
 
 /// This is not directly used by Sōzu but is available for example and testing purposes
-pub fn start(
+pub fn start_tcp_worker(
     config: TcpListenerConfig,
     max_buffers: usize,
     buffer_size: usize,
