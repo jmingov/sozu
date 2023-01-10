@@ -53,7 +53,7 @@ use crate::{
     sozu_command::{
         logging,
         proxy::{
-            AddCertificate, CertificateFingerprint, Cluster, HttpFrontend, HttpsListener,
+            AddCertificate, CertificateFingerprint, Cluster, HttpFrontend, HttpsListenerConfig,
             ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseContent,
             ProxyResponseStatus, Query, QueryAnswer, QueryAnswerCertificate, QueryCertificateType,
             RemoveCertificate, Route, TlsVersion,
@@ -85,8 +85,8 @@ pub struct TlsCluster {
 pub enum State {
     Expect(ExpectProxyProtocol<MioTcpStream>, ServerConnection),
     Handshake(RustlsHandshake),
-    Http(Http<FrontRustls, Listener>),
-    WebSocket(Pipe<FrontRustls, Listener>),
+    Http(Http<FrontRustls, HttpsListener>),
+    WebSocket(Pipe<FrontRustls, HttpsListener>),
     Http2(Http2<FrontRustls>),
     /// Temporary state used to extract and take ownership over the previous state.
     /// It should always be replaced by the next valid state and thus never be encountered.
@@ -98,32 +98,32 @@ pub enum AlpnProtocols {
     Http11,
 }
 
-pub struct Session {
+pub struct HttpsSession {
     answers: Rc<RefCell<HttpAnswers>>,
     backend_timeout_duration: Duration,
     frontend_timeout_duration: Duration,
     frontend_timeout: TimeoutContainer,
     pub frontend_token: Token,
     last_event: Instant,
-    pub listener: Rc<RefCell<Listener>>,
+    pub listener: Rc<RefCell<HttpsListener>>,
     pub listener_token: Token,
     pub metrics: SessionMetrics,
     peer_address: Option<StdSocketAddr>,
     pool: Weak<RefCell<Pool>>,
-    proxy: Rc<RefCell<Proxy>>,
+    proxy: Rc<RefCell<HttpsProxy>>,
     pub public_address: StdSocketAddr,
     // TODO: rename into "state" or "state_protocol" or else
     protocol: State,
     sticky_name: String,
 }
 
-impl Session {
+impl HttpsSession {
     pub fn new(
         rustls_details: ServerConnection,
         sock: MioTcpStream,
         token: Token,
         pool: Weak<RefCell<Pool>>,
-        proxy: Rc<RefCell<Proxy>>,
+        proxy: Rc<RefCell<HttpsProxy>>,
         public_address: StdSocketAddr,
         expect_proxy: bool,
         sticky_name: String,
@@ -133,8 +133,8 @@ impl Session {
         frontend_timeout_duration: Duration,
         backend_timeout_duration: Duration,
         request_timeout_duration: Duration,
-        listener: Rc<RefCell<Listener>>,
-    ) -> Session {
+        listener: Rc<RefCell<HttpsListener>>,
+    ) -> HttpsSession {
         let peer_address = if expect_proxy {
             // Will be defined later once the expect proxy header has been received and parsed
             None
@@ -163,7 +163,7 @@ impl Session {
         };
 
         let metrics = SessionMetrics::new(Some(wait_time));
-        let mut session = Session {
+        let mut session = HttpsSession {
             frontend_token: token,
             protocol: state,
             public_address,
@@ -365,7 +365,7 @@ impl Session {
         }
     }
 
-    fn upgrade_http(&self, mut http: Http<FrontRustls, Listener>) -> Option<State> {
+    fn upgrade_http(&self, mut http: Http<FrontRustls, HttpsListener>) -> Option<State> {
         debug!("https switching to wss");
         let front_token = self.frontend_token;
         let back_token = unwrap_msg!(http.backend_token);
@@ -439,7 +439,7 @@ impl Session {
         todo!()
     }
 
-    fn upgrade_websocket(&self, websocket: Pipe<FrontRustls, Listener>) -> Option<State> {
+    fn upgrade_websocket(&self, websocket: Pipe<FrontRustls, HttpsListener>) -> Option<State> {
         // what do we do here?
         error!("Upgrade called on WSS, this should not happen");
         Some(State::WebSocket(websocket))
@@ -1423,7 +1423,7 @@ impl Session {
     */
 }
 
-impl ProxySession for Session {
+impl ProxySession for HttpsSession {
     fn close(&mut self) {
         self.metrics.service_stop();
 
@@ -1510,7 +1510,6 @@ impl ProxySession for Session {
         Protocol::HTTPS
     }
 
-    // TODO: rename to update_readiness
     fn update_readiness(&mut self, token: Token, events: Ready) {
         trace!(
             "token {:?} got event {}",
@@ -1627,12 +1626,12 @@ pub enum ListenerError {
     BuildRustlsError(String),
 }
 
-pub struct Listener {
+pub struct HttpsListener {
     listener: Option<MioTcpListener>,
     address: StdSocketAddr,
     fronts: Router,
     answers: Rc<RefCell<HttpAnswers>>,
-    config: HttpsListener,
+    config: HttpsListenerConfig,
     resolver: Arc<MutexWrappedCertificateResolver>,
     // resolver: Arc<Mutex<GenericCertificateResolver>>,
     rustls_details: Arc<ServerConfig>,
@@ -1641,7 +1640,7 @@ pub struct Listener {
     tags: BTreeMap<String, BTreeMap<String, String>>,
 }
 
-impl ListenerHandler for Listener {
+impl ListenerHandler for HttpsListener {
     fn get_addr(&self) -> &StdSocketAddr {
         &self.address
     }
@@ -1658,7 +1657,7 @@ impl ListenerHandler for Listener {
     }
 }
 
-impl HttpListenerHandler for Listener {
+impl HttpListenerHandler for HttpsListener {
     fn get_sticky_name(&self) -> &str {
         &self.config.sticky_name
     }
@@ -1704,7 +1703,7 @@ impl HttpListenerHandler for Listener {
     }
 }
 
-impl CertificateResolver for Listener {
+impl CertificateResolver for HttpsListener {
     type Error = ListenerError;
 
     fn get_certificate(
@@ -1752,13 +1751,16 @@ impl CertificateResolver for Listener {
     }
 }
 
-impl Listener {
-    pub fn try_new(config: HttpsListener, token: Token) -> Result<Listener, ListenerError> {
+impl HttpsListener {
+    pub fn try_new(
+        config: HttpsListenerConfig,
+        token: Token,
+    ) -> Result<HttpsListener, ListenerError> {
         let resolver = Arc::new(MutexWrappedCertificateResolver::new());
 
         let server_config = Arc::new(Self::create_rustls_context(&config, resolver.to_owned())?);
 
-        Ok(Listener {
+        Ok(HttpsListener {
             listener: None,
             address: config.address,
             resolver,
@@ -1800,7 +1802,7 @@ impl Listener {
     }
 
     pub fn create_rustls_context(
-        config: &HttpsListener,
+        config: &HttpsListenerConfig,
         resolver: Arc<MutexWrappedCertificateResolver>,
     ) -> Result<ServerConfig, ListenerError> {
         let cipher_names = if config.cipher_list.is_empty() {
@@ -1894,8 +1896,8 @@ impl Listener {
     }
 }
 
-pub struct Proxy {
-    listeners: HashMap<Token, Rc<RefCell<Listener>>>,
+pub struct HttpsProxy {
+    listeners: HashMap<Token, Rc<RefCell<HttpsListener>>>,
     clusters: HashMap<ClusterId, Cluster>,
     backends: Rc<RefCell<BackendMap>>,
     pool: Rc<RefCell<Pool>>,
@@ -1903,14 +1905,14 @@ pub struct Proxy {
     sessions: Rc<RefCell<SessionManager>>,
 }
 
-impl Proxy {
+impl HttpsProxy {
     pub fn new(
         registry: Registry,
         sessions: Rc<RefCell<SessionManager>>,
         pool: Rc<RefCell<Pool>>,
         backends: Rc<RefCell<BackendMap>>,
-    ) -> Proxy {
-        Proxy {
+    ) -> HttpsProxy {
+        HttpsProxy {
             listeners: HashMap::new(),
             clusters: HashMap::new(),
             backends,
@@ -1920,11 +1922,11 @@ impl Proxy {
         }
     }
 
-    pub fn add_listener(&mut self, config: HttpsListener, token: Token) -> Option<Token> {
+    pub fn add_listener(&mut self, config: HttpsListenerConfig, token: Token) -> Option<Token> {
         match self.listeners.entry(token) {
             Entry::Vacant(entry) => {
                 entry.insert(Rc::new(RefCell::new(
-                    Listener::try_new(config, token).ok()?,
+                    HttpsListener::try_new(config, token).ok()?,
                 )));
                 Some(token)
             }
@@ -2248,7 +2250,7 @@ impl Proxy {
     }
 }
 
-impl ProxyConfiguration for Proxy {
+impl ProxyConfiguration for HttpsProxy {
     fn accept(&mut self, token: ListenToken) -> Result<MioTcpStream, AcceptError> {
         match self.listeners.get(&Token(token.0)) {
             Some(listener) => listener.borrow_mut().accept(),
@@ -2298,7 +2300,7 @@ impl ProxyConfiguration for Proxy {
                 AcceptError::RegisterError
             })?;
 
-        let session = Rc::new(RefCell::new(Session::new(
+        let session = Rc::new(RefCell::new(HttpsSession::new(
             rustls_details,
             frontend_sock,
             session_token,
@@ -2445,7 +2447,7 @@ impl ProxyConfiguration for Proxy {
         }
     }
 }
-impl HttpProxyTrait for Proxy {
+impl HttpProxyTrait for HttpsProxy {
     fn register_socket(
         &self,
         socket: &mut MioTcpStream,
@@ -2528,7 +2530,7 @@ fn rustls_ciphersuite_str(cipher: SupportedCipherSuite) -> &'static str {
 
 /// this function is not used, but is available for example and testing purposes
 pub fn start(
-    config: HttpsListener,
+    config: HttpsListenerConfig,
     channel: ProxyChannel,
     max_buffers: usize,
     buffer_size: usize,
@@ -2581,7 +2583,7 @@ pub fn start(
         .registry()
         .try_clone()
         .with_context(|| "Failed at creating a registry")?;
-    let mut proxy = Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
+    let mut proxy = HttpsProxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
     let address = config.address;
     if proxy.add_listener(config, token).is_some()
         && proxy.activate_listener(&address, None).is_ok()
@@ -2689,7 +2691,7 @@ mod tests {
 
         let rustls_details = Arc::new(server_config);
 
-        let listener = Listener {
+        let listener = HttpsListener {
             listener: None,
             address,
             fronts,

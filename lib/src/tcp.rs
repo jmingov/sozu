@@ -8,7 +8,12 @@ use std::{
 };
 
 use anyhow::{bail, Context};
-use mio::{net::*, unix::SourceFd, *};
+use mio::{
+    net::TcpListener as MioTcpListener,
+    net::{TcpStream as MioTcpStream, UnixStream},
+    unix::SourceFd,
+    Interest, Poll, Registry, Token,
+};
 use rusty_ulid::Ulid;
 use slab::Slab;
 use time::{Duration, Instant};
@@ -33,7 +38,7 @@ use crate::{
         logging,
         proxy::{
             ProxyEvent, ProxyRequest, ProxyRequestOrder, ProxyResponse, TcpFrontend,
-            TcpListener as TcpListenerConfig,
+            TcpListenerConfig,
         },
         ready::Ready,
         scm_socket::ScmSocket,
@@ -52,13 +57,13 @@ pub enum UpgradeResult {
 }
 
 pub enum State {
-    Pipe(Pipe<TcpStream, Listener>),
-    SendProxyProtocol(SendProxyProtocol<TcpStream>),
-    RelayProxyProtocol(RelayProxyProtocol<TcpStream>),
-    ExpectProxyProtocol(ExpectProxyProtocol<TcpStream>),
+    Pipe(Pipe<MioTcpStream, TcpListener>),
+    SendProxyProtocol(SendProxyProtocol<MioTcpStream>),
+    RelayProxyProtocol(RelayProxyProtocol<MioTcpStream>),
+    ExpectProxyProtocol(ExpectProxyProtocol<MioTcpStream>),
 }
 
-pub struct Session {
+pub struct TcpSession {
     accept_token: Token,
     backend_buffer: Option<Checkout>,
     backend_connected: BackendConnectionStatus,
@@ -73,19 +78,19 @@ pub struct Session {
     frontend_timeout: TimeoutContainer,
     frontend_token: Token,
     last_event: Instant,
-    listener: Rc<RefCell<Listener>>,
+    listener: Rc<RefCell<TcpListener>>,
     metrics: SessionMetrics,
     protocol: Option<State>,
-    proxy: Rc<RefCell<Proxy>>,
+    proxy: Rc<RefCell<TcpProxy>>,
     request_id: Ulid,
 }
 
-impl Session {
+impl TcpSession {
     fn new(
-        sock: TcpStream,
+        sock: MioTcpStream,
         frontend_token: Token,
         accept_token: Token,
-        proxy: Rc<RefCell<Proxy>>,
+        proxy: Rc<RefCell<TcpProxy>>,
         front_buf: Checkout,
         back_buf: Checkout,
         cluster_id: Option<String>,
@@ -94,8 +99,8 @@ impl Session {
         wait_time: Duration,
         front_timeout_duration: Duration,
         backend_timeout_duration: Duration,
-        listener: Rc<RefCell<Listener>>,
-    ) -> Session {
+        listener: Rc<RefCell<TcpListener>>,
+    ) -> TcpSession {
         let frontend_address = sock.peer_addr().ok();
         let mut frontend_buffer = None;
         let mut backend_buffer = None;
@@ -161,7 +166,7 @@ impl Session {
         let metrics = SessionMetrics::new(Some(wait_time));
         //FIXME: timeout usage
 
-        Session {
+        TcpSession {
             backend: None,
             frontend_token,
             backend_token: None,
@@ -333,7 +338,7 @@ impl Session {
         res.1
     }
 
-    fn front_socket(&self) -> &TcpStream {
+    fn front_socket(&self) -> &MioTcpStream {
         match self.protocol {
             Some(State::Pipe(ref pipe)) => pipe.front_socket(),
             Some(State::SendProxyProtocol(ref pp)) => pp.front_socket(),
@@ -343,7 +348,7 @@ impl Session {
         }
     }
 
-    fn back_socket_mut(&mut self) -> Option<&mut TcpStream> {
+    fn back_socket_mut(&mut self) -> Option<&mut MioTcpStream> {
         match self.protocol {
             Some(State::Pipe(ref mut pipe)) => pipe.back_socket_mut(),
             Some(State::SendProxyProtocol(ref mut pp)) => pp.back_socket_mut(),
@@ -374,7 +379,8 @@ impl Session {
             }
         } else if let Some(State::RelayProxyProtocol(pp)) = protocol {
             if self.backend_buffer.is_some() {
-                let mut pipe = pp.into_pipe(self.backend_buffer.take().unwrap(), self.listener.clone());
+                let mut pipe =
+                    pp.into_pipe(self.backend_buffer.take().unwrap(), self.listener.clone());
                 pipe.set_cluster_id(self.cluster_id.clone());
                 self.protocol = Some(State::Pipe(pipe));
                 gauge_add!("protocol.proxy.relay", -1);
@@ -437,7 +443,7 @@ impl Session {
     //     }
     // }
 
-    fn set_back_socket(&mut self, socket: TcpStream) {
+    fn set_back_socket(&mut self, socket: MioTcpStream) {
         match self.protocol {
             Some(State::Pipe(ref mut pipe)) => pipe.set_back_socket(socket),
             Some(State::SendProxyProtocol(ref mut pp)) => pp.set_back_socket(socket),
@@ -885,7 +891,7 @@ impl Session {
             })?;
         /*
         this was the old error matching for backend_from_cluster_id.
-        panic! is called in case of mio::net::TcpStream::connect() error
+        panic! is called in case of mio::net::MioTcpStream::connect() error
         Do we really want to panic ?
         Err(ConnectionError::NoBackendAvailable(c_id)) => {
             Err(ConnectionError::NoBackendAvailable(c_id))
@@ -940,7 +946,7 @@ impl Session {
     }
 }
 
-impl ProxySession for Session {
+impl ProxySession for TcpSession {
     fn close(&mut self) {
         self.metrics.service_stop();
         self.cancel_timeouts();
@@ -1074,9 +1080,9 @@ impl ProxySession for Session {
     }
 }
 
-pub struct Listener {
+pub struct TcpListener {
     cluster_id: Option<String>,
-    listener: Option<TcpListener>,
+    listener: Option<MioTcpListener>,
     token: Token,
     address: SocketAddr,
     pool: Rc<RefCell<Pool>>,
@@ -1085,7 +1091,7 @@ pub struct Listener {
     tags: BTreeMap<String, BTreeMap<String, String>>,
 }
 
-impl ListenerHandler for Listener {
+impl ListenerHandler for TcpListener {
     fn get_addr(&self) -> &SocketAddr {
         &self.address
     }
@@ -1102,9 +1108,9 @@ impl ListenerHandler for Listener {
     }
 }
 
-impl Listener {
-    fn new(config: TcpListenerConfig, pool: Rc<RefCell<Pool>>, token: Token) -> Listener {
-        Listener {
+impl TcpListener {
+    fn new(config: TcpListenerConfig, pool: Rc<RefCell<Pool>>, token: Token) -> TcpListener {
+        TcpListener {
             cluster_id: None,
             listener: None,
             token,
@@ -1120,7 +1126,7 @@ impl Listener {
     pub fn activate(
         &mut self,
         registry: &Registry,
-        tcp_listener: Option<TcpListener>,
+        tcp_listener: Option<MioTcpListener>,
     ) -> Option<Token> {
         if self.active {
             return Some(self.token);
@@ -1158,22 +1164,22 @@ pub struct ClusterConfiguration {
     // load_balancing: LoadBalancingAlgorithms,
 }
 
-pub struct Proxy {
+pub struct TcpProxy {
     fronts: HashMap<String, Token>,
     backends: Rc<RefCell<BackendMap>>,
-    listeners: HashMap<Token, Rc<RefCell<Listener>>>,
+    listeners: HashMap<Token, Rc<RefCell<TcpListener>>>,
     configs: HashMap<ClusterId, ClusterConfiguration>,
     registry: Registry,
     sessions: Rc<RefCell<SessionManager>>,
 }
 
-impl Proxy {
+impl TcpProxy {
     pub fn new(
         registry: Registry,
         sessions: Rc<RefCell<SessionManager>>,
         backends: Rc<RefCell<BackendMap>>,
-    ) -> Proxy {
-        Proxy {
+    ) -> TcpProxy {
+        TcpProxy {
             backends,
             listeners: HashMap::new(),
             configs: HashMap::new(),
@@ -1192,7 +1198,7 @@ impl Proxy {
     ) -> Option<Token> {
         match self.listeners.entry(token) {
             Entry::Vacant(entry) => {
-                entry.insert(Rc::new(RefCell::new(Listener::new(config, pool, token))));
+                entry.insert(Rc::new(RefCell::new(TcpListener::new(config, pool, token))));
                 Some(token)
             }
             _ => None,
@@ -1210,7 +1216,7 @@ impl Proxy {
     pub fn activate_listener(
         &self,
         addr: &SocketAddr,
-        tcp_listener: Option<TcpListener>,
+        tcp_listener: Option<MioTcpListener>,
     ) -> Option<Token> {
         self.listeners
             .values()
@@ -1218,7 +1224,7 @@ impl Proxy {
             .and_then(|listener| listener.borrow_mut().activate(&self.registry, tcp_listener))
     }
 
-    pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, TcpListener)> {
+    pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, MioTcpListener)> {
         self.listeners
             .values()
             .filter_map(|listener| {
@@ -1233,7 +1239,7 @@ impl Proxy {
     }
 
     // TODO: return Result with context
-    pub fn give_back_listener(&mut self, address: SocketAddr) -> Option<(Token, TcpListener)> {
+    pub fn give_back_listener(&mut self, address: SocketAddr) -> Option<(Token, MioTcpListener)> {
         self.listeners
             .values()
             .find(|listener| listener.borrow().address == address)
@@ -1294,7 +1300,7 @@ impl Proxy {
     }
 }
 
-impl ProxyConfiguration for Proxy {
+impl ProxyConfiguration for TcpProxy {
     fn notify(&mut self, message: ProxyRequest) -> ProxyResponse {
         match message.order {
             ProxyRequestOrder::AddTcpFrontend(front) => {
@@ -1380,7 +1386,7 @@ impl ProxyConfiguration for Proxy {
         }
     }
 
-    fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
+    fn accept(&mut self, token: ListenToken) -> Result<MioTcpStream, AcceptError> {
         let internal_token = Token(token.0);
         if let Some(listener) = self.listeners.get(&internal_token) {
             if let Some(tcp_listener) = &listener.borrow().listener {
@@ -1404,7 +1410,7 @@ impl ProxyConfiguration for Proxy {
 
     fn create_session(
         &mut self,
-        mut frontend_sock: TcpStream,
+        mut frontend_sock: MioTcpStream,
         token: ListenToken,
         wait_time: Duration,
         proxy: Rc<RefCell<Self>>,
@@ -1467,7 +1473,7 @@ impl ProxyConfiguration for Proxy {
             return Err(AcceptError::RegisterError);
         }
 
-        let session = Session::new(
+        let session = TcpSession::new(
             frontend_sock,
             session_token,
             internal_token,
@@ -1548,7 +1554,7 @@ pub fn start(
         .registry()
         .try_clone()
         .with_context(|| "Failed at creating a registry")?;
-    let mut configuration = Proxy::new(registry, sessions.clone(), backends.clone());
+    let mut configuration = TcpProxy::new(registry, sessions.clone(), backends.clone());
     let _ = configuration.add_listener(config, pool.clone(), token);
     let _ = configuration.activate_listener(&address, None);
     let (scm_server, _scm_client) =
@@ -1759,7 +1765,7 @@ mod tests {
 
             let sessions = SessionManager::new(sessions, max_connections);
             let registry = poll.registry().try_clone().unwrap();
-            let mut configuration = Proxy::new(registry, sessions.clone(), backends.clone());
+            let mut configuration = TcpProxy::new(registry, sessions.clone(), backends.clone());
             let listener_config = TcpListenerConfig {
                 address: "127.0.0.1:1234".parse().unwrap(),
                 public_address: None,

@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    io::{ErrorKind, Read, Write},
+    io::{ErrorKind, Write},
     rc::Rc,
 };
 
@@ -12,7 +12,7 @@ use crate::{
     protocol::{pipe::Pipe, ProtocolResult},
     socket::SocketHandler,
     sozu_command::ready::Ready,
-    tcp::Listener,
+    tcp::TcpListener,
     BackendConnectionStatus, Protocol, Readiness, SessionMetrics, SessionResult,
 };
 
@@ -161,8 +161,8 @@ impl<Front: SocketHandler> SendProxyProtocol<Front> {
         mut self,
         front_buf: Checkout,
         back_buf: Checkout,
-        listener: Rc<RefCell<Listener>>,
-    ) -> Pipe<Front, Listener> {
+        listener: Rc<RefCell<TcpListener>>,
+    ) -> Pipe<Front, TcpListener> {
         let backend_socket = self.backend.take().unwrap();
         let addr = self.front_socket().peer_addr().ok();
 
@@ -197,19 +197,20 @@ impl<Front: SocketHandler> SendProxyProtocol<Front> {
 
 #[cfg(test)]
 mod send_test {
-
-    use super::*;
-
-    use super::super::parser::parse_v2_header;
+    use std::{
+        io::Read,
+        net::{SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream},
+        os::unix::io::{FromRawFd, IntoRawFd},
+        sync::{Arc, Barrier},
+        thread::{self, JoinHandle},
+    };
 
     use mio::net::{TcpListener, TcpStream};
     use rusty_ulid::Ulid;
-    use std::net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream};
-    use std::os::unix::io::{FromRawFd, IntoRawFd};
-    use std::{
-        net::SocketAddr,
-        sync::{Arc, Barrier},
-        thread::{self, JoinHandle},
+
+    use super::{
+        super::parser::parse_v2_header, BackendConnectionStatus, ErrorKind, ProtocolResult,
+        SendProxyProtocol, SessionMetrics, SessionResult, Token,
     };
 
     #[test]

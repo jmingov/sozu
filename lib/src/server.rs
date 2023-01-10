@@ -13,7 +13,9 @@ use mio::{
     Events, Interest, Poll, Token,
 };
 use slab::Slab;
-use sozu_command::proxy::{ActivateListener, DeactivateListener, HttpListener, HttpsListener};
+use sozu_command::proxy::{
+    ActivateListener, DeactivateListener, HttpListenerConfig, HttpsListenerConfig,
+};
 use time::{Duration, Instant};
 
 use crate::{
@@ -29,7 +31,7 @@ use crate::{
             Backend as CommandLibBackend, Cluster, ListenerType, MessageId, ProxyEvent,
             ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseContent,
             ProxyResponseStatus, Query, QueryAnswer, QueryAnswerCertificate, QueryCertificateType,
-            QueryClusterType, RemoveBackend, TcpListener as CommandTcpListener,
+            QueryClusterType, RemoveBackend, TcpListenerConfig as CommandTcpListener,
         },
         ready::Ready,
         scm_socket::{Listeners, ScmSocket},
@@ -263,9 +265,9 @@ pub struct Server {
     shutting_down: Option<MessageId>,
     accept_ready: HashSet<ListenToken>,
     channel: ProxyChannel,
-    http: Rc<RefCell<http::Proxy>>,
-    https: Rc<RefCell<https::Proxy>>,
-    tcp: Rc<RefCell<tcp::Proxy>>,
+    http: Rc<RefCell<http::HttpProxy>>,
+    https: Rc<RefCell<https::HttpsProxy>>,
+    tcp: Rc<RefCell<tcp::TcpProxy>>,
     config_state: ConfigState,
     scm: ScmSocket,
     sessions: Rc<RefCell<SessionManager>>,
@@ -339,7 +341,8 @@ impl Server {
             .try_clone()
             .with_context(|| "could not clone the mio Registry")?;
 
-        let https = https::Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
+        let https =
+            https::HttpsProxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
 
         Server::new(
             event_loop,
@@ -364,9 +367,9 @@ impl Server {
         sessions: Rc<RefCell<SessionManager>>,
         pool: Rc<RefCell<Pool>>,
         backends: Rc<RefCell<BackendMap>>,
-        http: Option<http::Proxy>,
-        https: Option<https::Proxy>,
-        tcp: Option<tcp::Proxy>,
+        http: Option<http::HttpProxy>,
+        https: Option<https::HttpsProxy>,
+        tcp: Option<tcp::TcpProxy>,
         server_config: ServerConfig,
         config_state: Option<ConfigState>,
         expects_initial_status: bool,
@@ -400,7 +403,7 @@ impl Server {
                     .registry()
                     .try_clone()
                     .with_context(|| "could not clone the mio Registry")?;
-                http::Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone())
+                http::HttpProxy::new(registry, sessions.clone(), pool.clone(), backends.clone())
             }
         }));
 
@@ -412,7 +415,7 @@ impl Server {
                     .try_clone()
                     .with_context(|| "could not clone the mio Registry")?;
 
-                https::Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone())
+                https::HttpsProxy::new(registry, sessions.clone(), pool.clone(), backends.clone())
             }
         }));
 
@@ -423,7 +426,7 @@ impl Server {
                     .registry()
                     .try_clone()
                     .with_context(|| "could not clone the mio Registry")?;
-                tcp::Proxy::new(registry, sessions.clone(), backends.clone())
+                tcp::TcpProxy::new(registry, sessions.clone(), backends.clone())
             }
         }));
 
@@ -1081,7 +1084,11 @@ impl Server {
         ProxyResponse::ok(req_id)
     }
 
-    fn notify_add_http_listener(&mut self, req_id: &str, listener: &HttpListener) -> ProxyResponse {
+    fn notify_add_http_listener(
+        &mut self,
+        req_id: &str,
+        listener: &HttpListenerConfig,
+    ) -> ProxyResponse {
         debug!("{} add http listener {:?}", req_id, listener);
 
         if self.sessions.borrow().slab.len() >= self.sessions.borrow().slab_capacity() {
@@ -1113,7 +1120,7 @@ impl Server {
     fn notify_add_https_listener(
         &mut self,
         req_id: &str,
-        listener: &HttpsListener,
+        listener: &HttpsListenerConfig,
     ) -> ProxyResponse {
         debug!("{} add https listener {:?}", req_id, listener);
 

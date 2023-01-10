@@ -16,9 +16,9 @@ use crate::{
     command::{CommandRequest, CommandRequestOrder, PROTOCOL_VERSION},
     proxy::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, Cluster, HttpFrontend,
-        HttpListener, HttpsListener, ListenerType, LoadBalancingAlgorithms, LoadBalancingParams,
-        LoadMetric, PathRule, ProxyRequestOrder, Route, RulePosition, TcpFrontend, TcpListener,
-        TlsVersion,
+        HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
+        LoadBalancingParams, LoadMetric, PathRule, ProxyRequestOrder, Route, RulePosition,
+        TcpFrontend, TcpListenerConfig, TlsVersion,
     },
 };
 
@@ -117,7 +117,7 @@ impl Listener {
         back_timeout: Option<u32>,
         connect_timeout: Option<u32>,
         request_timeout: Option<u32>,
-    ) -> anyhow::Result<HttpListener> {
+    ) -> anyhow::Result<HttpListenerConfig> {
         if self.protocol != FileListenerProtocolConfig::Http {
             bail!("cannot convert listener to HTTP");
         }
@@ -137,7 +137,7 @@ impl Listener {
         */
         // let http_proxy_configuration = Some(self.address);
 
-        let mut configuration = HttpListener {
+        let mut configuration = HttpListenerConfig {
             address: self.address,
             public_address: self.public_address,
             expect_proxy: self.expect_proxy.unwrap_or(false),
@@ -164,7 +164,7 @@ impl Listener {
         back_timeout: Option<u32>,
         connect_timeout: Option<u32>,
         request_timeout: Option<u32>,
-    ) -> anyhow::Result<HttpsListener> {
+    ) -> anyhow::Result<HttpsListenerConfig> {
         if self.protocol != FileListenerProtocolConfig::Https {
             bail!("cannot convert listener to HTTPS");
         }
@@ -216,7 +216,7 @@ impl Listener {
 
         let expect_proxy = self.expect_proxy.unwrap_or(false);
 
-        let mut configuration = HttpsListener {
+        let mut configuration = HttpsListenerConfig {
             address: self.address,
             sticky_name: self.sticky_name.clone(),
             public_address: self.public_address,
@@ -251,7 +251,7 @@ impl Listener {
         front_timeout: Option<u32>,
         back_timeout: Option<u32>,
         connect_timeout: Option<u32>,
-    ) -> anyhow::Result<TcpListener> {
+    ) -> anyhow::Result<TcpListenerConfig> {
         // what does this code do? should we remove it?
         /*let mut address = self.address.clone();
         address.push(':');
@@ -269,7 +269,7 @@ impl Listener {
         let addr = addr_parsed;
         */
 
-        Ok(TcpListener {
+        Ok(TcpListenerConfig {
             address: self.address,
             public_address: self.public_address,
             expect_proxy: self.expect_proxy.unwrap_or(false),
@@ -1126,9 +1126,9 @@ pub struct Config {
     pub worker_count: u16,
     pub worker_automatic_restart: bool,
     pub metrics: Option<MetricsConfig>,
-    pub http_listeners: Vec<HttpListener>,
-    pub https_listeners: Vec<HttpsListener>,
-    pub tcp_listeners: Vec<TcpListener>,
+    pub http_listeners: Vec<HttpListenerConfig>,
+    pub https_listeners: Vec<HttpsListenerConfig>,
+    pub tcp_listeners: Vec<TcpListenerConfig>,
     pub clusters: HashMap<String, ClusterConfig>,
     pub handle_process_affinity: bool,
     pub ctl_command_timeout: u64,

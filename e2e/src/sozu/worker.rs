@@ -14,9 +14,9 @@ use sozu_command::{
     channel::Channel,
     config::{Config, FileConfig},
     proxy::{
-        Backend, Cluster, HttpFrontend, HttpListener, HttpsListener, LoadBalancingAlgorithms,
+        Backend, Cluster, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, LoadBalancingAlgorithms,
         LoadBalancingParams, PathRule, ProxyRequest, ProxyRequestOrder, ProxyResponse, Route,
-        RulePosition, TcpFrontend, TcpListener,
+        RulePosition, TcpFrontend, TcpListenerConfig,
     },
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
@@ -281,8 +281,8 @@ impl Worker {
         result
     }
 
-    pub fn default_tcp_listener(address: SocketAddr) -> TcpListener {
-        TcpListener {
+    pub fn default_tcp_listener(address: SocketAddr) -> TcpListenerConfig {
+        TcpListenerConfig {
             address,
             public_address: None,
             expect_proxy: false,
@@ -292,27 +292,27 @@ impl Worker {
         }
     }
 
-    pub fn default_http_listener(address: SocketAddr) -> HttpListener {
-        HttpListener {
+    pub fn default_http_listener(address: SocketAddr) -> HttpListenerConfig {
+        HttpListenerConfig {
             address,
             public_address: None,
             expect_proxy: false,
             front_timeout: 60,
             back_timeout: 30,
             connect_timeout: 3,
-            ..HttpListener::default()
+            ..HttpListenerConfig::default()
         }
     }
 
-    pub fn default_https_listener(address: SocketAddr) -> HttpsListener {
-        HttpsListener {
+    pub fn default_https_listener(address: SocketAddr) -> HttpsListenerConfig {
+        HttpsListenerConfig {
             address,
             public_address: None,
             expect_proxy: false,
             front_timeout: 60,
             back_timeout: 30,
             connect_timeout: 3,
-            ..HttpsListener::default()
+            ..HttpsListenerConfig::default()
         }
     }
 

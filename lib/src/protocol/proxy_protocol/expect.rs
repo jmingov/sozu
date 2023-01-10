@@ -10,7 +10,7 @@ use crate::{
     protocol::{ProtocolResult, SessionState},
     socket::{SocketHandler, SocketResult},
     sozu_command::ready::Ready,
-    tcp::Listener,
+    tcp::TcpListener,
     Protocol, Readiness, SessionMetrics, SessionResult,
 };
 
@@ -162,8 +162,8 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
         back_buf: Checkout,
         backend_socket: Option<TcpStream>,
         backend_token: Option<Token>,
-        listener: Rc<RefCell<Listener>>,
-    ) -> Pipe<Front, Listener> {
+        listener: Rc<RefCell<TcpListener>>,
+    ) -> Pipe<Front, TcpListener> {
         let addr = self.front_socket().peer_addr().ok();
 
         let mut pipe = Pipe::new(

@@ -10,7 +10,7 @@ use crate::{
     protocol::{pipe::Pipe, ProtocolResult},
     socket::{SocketHandler, SocketResult},
     sozu_command::ready::Ready,
-    tcp::Listener,
+    tcp::TcpListener,
     Protocol, Readiness, SessionMetrics, SessionResult,
 };
 
@@ -185,8 +185,8 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
     pub fn into_pipe(
         mut self,
         back_buf: Checkout,
-        listener: Rc<RefCell<Listener>>,
-    ) -> Pipe<Front, Listener> {
+        listener: Rc<RefCell<TcpListener>>,
+    ) -> Pipe<Front, TcpListener> {
         let backend_socket = self.backend.take().unwrap();
         let addr = self.front_socket().peer_addr().ok();
 

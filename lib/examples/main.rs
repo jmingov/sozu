@@ -46,7 +46,7 @@ fn main() -> anyhow::Result<()> {
     );
     gauge!("sozu.TEST", 42);
 
-    let config = proxy::HttpListener {
+    let config = proxy::HttpListenerConfig {
         address: "127.0.0.1:8080"
             .parse()
             .with_context(|| "could not parse address")?,
@@ -97,7 +97,7 @@ fn main() -> anyhow::Result<()> {
     info!("MAIN\tHTTP -> {:?}", command.read_message());
     info!("MAIN\tHTTP -> {:?}", command.read_message());
 
-    let config = proxy::HttpsListener {
+    let config = proxy::HttpsListenerConfig {
         address: "127.0.0.1:8443"
             .parse()
             .with_context(|| "could not parse address")?,

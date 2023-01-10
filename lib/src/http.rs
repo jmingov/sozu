@@ -21,8 +21,8 @@ use crate::{
     sozu_command::{
         logging,
         proxy::{
-            Cluster, HttpFrontend, HttpListener, ProxyRequest, ProxyRequestOrder, ProxyResponse,
-            Route,
+            Cluster, HttpFrontend, HttpListenerConfig, ProxyRequest, ProxyRequestOrder,
+            ProxyResponse, Route,
         },
         ready::Ready,
         scm_socket::{Listeners, ScmSocket},
@@ -58,36 +58,36 @@ pub enum SessionStatus {
 
 pub enum State {
     Expect(ExpectProxyProtocol<TcpStream>),
-    Http(Http<TcpStream, Listener>),
-    WebSocket(Pipe<TcpStream, Listener>),
+    Http(Http<TcpStream, HttpListener>),
+    WebSocket(Pipe<TcpStream, HttpListener>),
 }
 
 /// HTTP Session to insert in the SessionManager
 ///
 /// 1 session <=> 1 HTTP connection (client to sozu)
-pub struct Session {
+pub struct HttpSession {
     answers: Rc<RefCell<HttpAnswers>>,
     backend_timeout_duration: Duration,
     frontend_timeout_duration: Duration,
     frontend_timeout: TimeoutContainer,
     frontend_token: Token,
     last_event: Instant,
-    listener: Rc<RefCell<Listener>>,
+    listener: Rc<RefCell<HttpListener>>,
     pub listener_token: Token,
     metrics: SessionMetrics,
     pool: Weak<RefCell<Pool>>,
     // TODO: rename into "state" or "state_protocol" or else
     protocol: Option<State>,
-    proxy: Rc<RefCell<Proxy>>,
+    proxy: Rc<RefCell<HttpProxy>>,
     sticky_name: String,
 }
 
-impl Session {
+impl HttpSession {
     pub fn new(
         sock: TcpStream,
         token: Token,
         pool: Weak<RefCell<Pool>>,
-        proxy: Rc<RefCell<Proxy>>,
+        proxy: Rc<RefCell<HttpProxy>>,
         public_address: SocketAddr,
         expect_proxy: bool,
         sticky_name: String,
@@ -97,7 +97,7 @@ impl Session {
         frontend_timeout_duration: Duration,
         backend_timeout_duration: Duration,
         request_timeout_duration: Duration,
-        listener: Rc<RefCell<Listener>>,
+        listener: Rc<RefCell<HttpListener>>,
     ) -> Self {
         let request_id = Ulid::generate();
         let mut front_timeout = TimeoutContainer::new_empty(request_timeout_duration);
@@ -130,7 +130,7 @@ impl Session {
         };
 
         let metrics = SessionMetrics::new(Some(wait_time));
-        let mut session = Session {
+        let mut session = HttpSession {
             protocol: Some(state),
             proxy,
             frontend_token: token,
@@ -533,7 +533,7 @@ impl Session {
     }
 }
 
-impl ProxySession for Session {
+impl ProxySession for HttpSession {
     fn close(&mut self) {
         self.metrics.service_stop();
 
@@ -605,7 +605,6 @@ impl ProxySession for Session {
         Protocol::HTTP
     }
 
-    /// this seems to update session readiness but it does not process events
     fn update_readiness(&mut self, token: Token, events: Ready) {
         trace!(
             "token {:?} got event {}",
@@ -699,18 +698,18 @@ impl ProxySession for Session {
 
 pub type Hostname = String;
 
-pub struct Listener {
+pub struct HttpListener {
     listener: Option<TcpListener>,
     pub address: SocketAddr,
     fronts: Router,
     answers: Rc<RefCell<HttpAnswers>>,
-    pub config: HttpListener,
+    pub config: HttpListenerConfig,
     pub token: Token,
     pub active: bool,
     tags: BTreeMap<String, BTreeMap<String, String>>,
 }
 
-impl ListenerHandler for Listener {
+impl ListenerHandler for HttpListener {
     fn get_addr(&self) -> &SocketAddr {
         &self.address
     }
@@ -727,7 +726,7 @@ impl ListenerHandler for Listener {
     }
 }
 
-impl HttpListenerHandler for Listener {
+impl HttpListenerHandler for HttpListener {
     fn get_sticky_name(&self) -> &str {
         &self.config.sticky_name
     }
@@ -778,8 +777,8 @@ impl HttpListenerHandler for Listener {
     }
 }
 
-pub struct Proxy {
-    pub listeners: HashMap<Token, Rc<RefCell<Listener>>>,
+pub struct HttpProxy {
+    pub listeners: HashMap<Token, Rc<RefCell<HttpListener>>>,
     pub backends: Rc<RefCell<BackendMap>>,
     pub clusters: HashMap<ClusterId, Cluster>,
     pool: Rc<RefCell<Pool>>,
@@ -787,14 +786,14 @@ pub struct Proxy {
     pub sessions: Rc<RefCell<SessionManager>>,
 }
 
-impl Proxy {
+impl HttpProxy {
     pub fn new(
         registry: Registry,
         sessions: Rc<RefCell<SessionManager>>,
         pool: Rc<RefCell<Pool>>,
         backends: Rc<RefCell<BackendMap>>,
-    ) -> Proxy {
-        Proxy {
+    ) -> HttpProxy {
+        HttpProxy {
             listeners: HashMap::new(),
             clusters: HashMap::new(),
             backends,
@@ -804,17 +803,17 @@ impl Proxy {
         }
     }
 
-    pub fn add_listener(&mut self, config: HttpListener, token: Token) -> Option<Token> {
+    pub fn add_listener(&mut self, config: HttpListenerConfig, token: Token) -> Option<Token> {
         match self.listeners.entry(token) {
             Entry::Vacant(entry) => {
-                entry.insert(Rc::new(RefCell::new(Listener::new(config, token))));
+                entry.insert(Rc::new(RefCell::new(HttpListener::new(config, token))));
                 Some(token)
             }
             _ => None,
         }
     }
 
-    pub fn get_listener(&self, token: &Token) -> Option<Rc<RefCell<Listener>>> {
+    pub fn get_listener(&self, token: &Token) -> Option<Rc<RefCell<HttpListener>>> {
         self.listeners.get(token).map(Clone::clone)
     }
 
@@ -991,9 +990,9 @@ impl Proxy {
     }
 }
 
-impl Listener {
-    pub fn new(config: HttpListener, token: Token) -> Listener {
-        Listener {
+impl HttpListener {
+    pub fn new(config: HttpListenerConfig, token: Token) -> HttpListener {
+        HttpListener {
             listener: None,
             address: config.address,
             fronts: Router::new(),
@@ -1063,7 +1062,7 @@ impl Listener {
     }
 }
 
-impl ProxyConfiguration for Proxy {
+impl ProxyConfiguration for HttpProxy {
     fn notify(&mut self, request: ProxyRequest) -> ProxyResponse {
         let request_id = request.id.clone();
 
@@ -1197,7 +1196,7 @@ impl ProxyConfiguration for Proxy {
             return Err(AcceptError::RegisterError);
         }
 
-        let session = Session::new(
+        let session = HttpSession::new(
             frontend_sock,
             session_token,
             Rc::downgrade(&self.pool),
@@ -1223,7 +1222,7 @@ impl ProxyConfiguration for Proxy {
     }
 }
 
-impl HttpProxyTrait for Proxy {
+impl HttpProxyTrait for HttpProxy {
     fn register_socket(
         &self,
         source: &mut TcpStream,
@@ -1264,7 +1263,7 @@ impl HttpProxyTrait for Proxy {
 
 /// This is not directly used by Sōzu but is available for example and testing purposes
 pub fn start(
-    config: HttpListener,
+    config: HttpListenerConfig,
     channel: ProxyChannel,
     max_buffers: usize,
     buffer_size: usize,
@@ -1317,7 +1316,7 @@ pub fn start(
         .registry()
         .try_clone()
         .with_context(|| "Failed at creating a registry")?;
-    let mut proxy = Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
+    let mut proxy = HttpProxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
     let _ = proxy.add_listener(config, token);
     let _ = proxy.activate_listener(&address, None);
     let (scm_server, scm_client) =
@@ -1368,7 +1367,7 @@ mod tests {
     use super::*;
     use crate::sozu_command::channel::Channel;
     use crate::sozu_command::proxy::{
-        Backend, HttpFrontend, HttpListener, LoadBalancingAlgorithms, LoadBalancingParams,
+        Backend, HttpFrontend, HttpListenerConfig, LoadBalancingAlgorithms, LoadBalancingParams,
         PathRule, ProxyRequest, ProxyRequestOrder, Route, RulePosition,
     };
     use std::io::{Read, Write};
@@ -1401,7 +1400,7 @@ mod tests {
 
         let address: SocketAddr =
             FromStr::from_str("127.0.0.1:1024").expect("could not parse address");
-        let config = HttpListener {
+        let config = HttpListenerConfig {
             address,
             ..Default::default()
         };
@@ -1488,7 +1487,7 @@ mod tests {
 
         let address: SocketAddr =
             FromStr::from_str("127.0.0.1:1031").expect("could not parse address");
-        let config = HttpListener {
+        let config = HttpListenerConfig {
             address,
             ..Default::default()
         };
@@ -1602,7 +1601,7 @@ mod tests {
         setup_test_logger!();
         let address: SocketAddr =
             FromStr::from_str("127.0.0.1:1041").expect("could not parse address");
-        let config = HttpListener {
+        let config = HttpListenerConfig {
             address,
             ..Default::default()
         };
@@ -1782,7 +1781,7 @@ mod tests {
 
         let address: SocketAddr =
             FromStr::from_str("127.0.0.1:1030").expect("could not parse address");
-        let listener = Listener {
+        let listener = HttpListener {
             listener: None,
             address,
             fronts,
