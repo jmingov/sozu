@@ -14,9 +14,9 @@ use sozu_command::{
     channel::Channel,
     config::{Config, FileConfig},
     proxy::{
-        Backend, Cluster, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, LoadBalancingAlgorithms,
-        LoadBalancingParams, PathRule, ProxyRequest, ProxyRequestOrder, ProxyResponse, Route,
-        RulePosition, TcpFrontend, TcpListenerConfig,
+        Backend, Cluster, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
+        LoadBalancingAlgorithms, LoadBalancingParams, PathRule, ProxyRequest, ProxyRequestOrder,
+        ProxyResponse, Route, RulePosition, TcpFrontend, TcpListenerConfig,
     },
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
