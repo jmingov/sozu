@@ -250,7 +250,7 @@ pub trait ProxySession {
     fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>);
     /// if the event loop got an event for a token associated with the session,
     /// it will call this method on the session
-    fn process_events(&mut self, token: Token, events: Ready);
+    fn update_readiness(&mut self, token: Token, events: Ready);
     /// closes a session
     fn close(&mut self);
     /// if a timeout associated with the session triggers, the event loop will

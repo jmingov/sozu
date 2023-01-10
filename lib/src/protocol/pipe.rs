@@ -859,7 +859,7 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
         ProtocolResult::Continue
     }
 
-    fn process_events(&mut self, token: Token, events: Ready) {
+    fn update_readiness(&mut self, token: Token, events: Ready) {
         if self.frontend_token == token {
             self.frontend_readiness.event |= events;
         } else if self.backend_token == Some(token) {

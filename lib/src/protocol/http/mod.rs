@@ -2607,7 +2607,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> SessionStat
     /// it updates the readiness
     ///
     /// TODO: rename me
-    fn process_events(&mut self, token: Token, events: Ready) {
+    fn update_readiness(&mut self, token: Token, events: Ready) {
         if self.frontend_token == token {
             self.frontend_readiness.event |= events;
         } else if self.backend_token == Some(token) {

@@ -268,7 +268,7 @@ impl<Front: SocketHandler> SessionState for ExpectProxyProtocol<Front> {
         ProtocolResult::Continue
     }
 
-    fn process_events(&mut self, token: Token, events: Ready) {
+    fn update_readiness(&mut self, token: Token, events: Ready) {
         if self.frontend_token == token {
             self.frontend_readiness.event |= events;
         }

@@ -1511,7 +1511,7 @@ impl ProxySession for Session {
     }
 
     // TODO: rename to update_readiness
-    fn process_events(&mut self, token: Token, events: Ready) {
+    fn update_readiness(&mut self, token: Token, events: Ready) {
         trace!(
             "token {:?} got event {}",
             token,
@@ -1521,7 +1521,7 @@ impl ProxySession for Session {
         self.metrics.wait_start();
 
         match &mut self.protocol {
-            State::Http(http) => http.process_events(token, events),
+            State::Http(http) => http.update_readiness(token, events),
             _ => {}
         }
     }

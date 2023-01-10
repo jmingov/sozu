@@ -997,7 +997,7 @@ impl ProxySession for Session {
         Protocol::TCP
     }
 
-    fn process_events(&mut self, token: Token, events: Ready) {
+    fn update_readiness(&mut self, token: Token, events: Ready) {
         trace!(
             "token {:?} got event {}",
             token,

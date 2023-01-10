@@ -606,7 +606,7 @@ impl ProxySession for Session {
     }
 
     /// this seems to update session readiness but it does not process events
-    fn process_events(&mut self, token: Token, events: Ready) {
+    fn update_readiness(&mut self, token: Token, events: Ready) {
         trace!(
             "token {:?} got event {}",
             token,
@@ -616,7 +616,7 @@ impl ProxySession for Session {
         self.metrics.wait_start();
 
         match &mut self.protocol {
-            Some(State::Http(http)) => http.process_events(token, events),
+            Some(State::Http(http)) => http.update_readiness(token, events),
             _ => {}
         }
     }

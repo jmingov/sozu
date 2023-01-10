@@ -1654,7 +1654,7 @@ impl Server {
 
             self.sessions.borrow_mut().slab[session_token]
                 .borrow_mut()
-                .process_events(token, events);
+                .update_readiness(token, events);
 
             let session = self.sessions.borrow_mut().slab[session_token].clone();
             session.borrow_mut().ready(session.clone());
@@ -1724,7 +1724,7 @@ impl ProxySession for ListenSession {
 
     fn shutting_down(&mut self) {}
 
-    fn process_events(&mut self, _token: Token, _events: Ready) {}
+    fn update_readiness(&mut self, _token: Token, _events: Ready) {}
 
     fn close(&mut self) {}
 
