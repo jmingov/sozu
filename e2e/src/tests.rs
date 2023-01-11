@@ -418,40 +418,6 @@ pub fn try_issue_810_panic(part2: bool) -> State {
     }
 }
 
-pub fn try_issue_810_panic_variant() -> State {
-    let front_address = "127.0.0.1:2001"
-        .parse()
-        .expect("could not parse front address");
-
-    let (config, listeners, state) = Worker::empty_config();
-    let (mut worker, mut backends) = sync_setup_test(config, listeners, state, front_address, 1);
-
-    let mut backend = backends.pop().expect("backend");
-    let mut client = Client::new("client", front_address, http_request("GET", "/api", "ping"));
-
-    backend.connect();
-    client.connect();
-    client.send();
-
-    worker.send_proxy_request(ProxyRequestOrder::SoftStop);
-    let success = worker.wait_for_server_stop();
-
-    println!(
-        "{} sent: {}, received: {}",
-        client.name, client.requests_sent, client.responses_received
-    );
-    println!(
-        "{} sent: {}, received: {}",
-        backend.name, backend.responses_sent, backend.requests_received
-    );
-
-    if success {
-        State::Success
-    } else {
-        State::Fail
-    }
-}
-
 pub fn test_upgrade() -> State {
     let front_address = "127.0.0.1:2001"
         .parse()
@@ -775,20 +741,7 @@ fn test_issue_810_panic_on_missing_listener() {
             repeat_until_error_or(
                 1000,
                 "issue 810: shutdown panics on tcp connection after proxy cleared its listeners\n(opinionated fix)",
-                || try_issue_810_panic(false)
-            ),
-            State::Success
-        );
-}
-
-#[serial]
-#[test]
-fn test_issue_810_panic_variant() {
-    assert_eq!(
-            repeat_until_error_or(
-                2,
-                "issue 810: shutdown panics on http connection accept after proxy cleared its listeners",
-                || try_issue_810_panic_variant()
+                || try_issue_810_panic(true)
             ),
             State::Success
         );
