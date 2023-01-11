@@ -79,9 +79,13 @@ pub struct Listener {
     pub certificate: Option<String>,
     pub certificate_chain: Option<String>,
     pub key: Option<String>,
+    /// maximum time of inactivity for a frontend socket
     pub front_timeout: Option<u32>,
+    /// maximum time of inactivity for a backend socket
     pub back_timeout: Option<u32>,
+    /// maximum time to connect to a backend server
     pub connect_timeout: Option<u32>,
+    /// maximum time to receive a request since the connection started
     pub request_timeout: Option<u32>,
 }
 

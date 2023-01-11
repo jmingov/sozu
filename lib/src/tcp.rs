@@ -107,7 +107,7 @@ impl TcpSession {
 
         let request_id = Ulid::generate();
         let front_timeout = TimeoutContainer::new(front_timeout_duration, frontend_token);
-        let back_timeout = TimeoutContainer::new_empty(backend_timeout_duration);
+        let backend_response_timeout = TimeoutContainer::new_empty(backend_timeout_duration);
 
         let protocol = match proxy_protocol {
             Some(ProxyProtocolConfig::RelayHeader) => {
@@ -183,7 +183,7 @@ impl TcpSession {
             connection_attempt: 0,
             frontend_address,
             frontend_timeout: front_timeout,
-            backend_timeout: back_timeout,
+            backend_timeout: backend_response_timeout,
             proxy,
             listener,
         }

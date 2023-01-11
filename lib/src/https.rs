@@ -100,18 +100,20 @@ pub enum AlpnProtocols {
 
 pub struct HttpsSession {
     answers: Rc<RefCell<HttpAnswers>>,
-    backend_timeout_duration: Duration,
-    frontend_timeout_duration: Duration,
-    frontend_timeout: TimeoutContainer,
-    pub frontend_token: Token,
+    configured_backend_timeout: Duration,
+    configured_connect_timeout: Duration,
+    configured_frontend_timeout: Duration,
+    configured_request_timeout: Duration,
+    container_frontend_timeout: TimeoutContainer,
+    frontend_token: Token,
     last_event: Instant,
-    pub listener: Rc<RefCell<HttpsListener>>,
-    pub listener_token: Token,
-    pub metrics: SessionMetrics,
+    listener: Rc<RefCell<HttpsListener>>,
+    listener_token: Token,
+    metrics: SessionMetrics,
     peer_address: Option<StdSocketAddr>,
     pool: Weak<RefCell<Pool>>,
     proxy: Rc<RefCell<HttpsProxy>>,
-    pub public_address: StdSocketAddr,
+    public_address: StdSocketAddr,
     // TODO: rename into "state" or "state_protocol" or else
     protocol: State,
     sticky_name: String,
@@ -119,21 +121,22 @@ pub struct HttpsSession {
 
 impl HttpsSession {
     pub fn new(
-        rustls_details: ServerConnection,
-        sock: MioTcpStream,
-        token: Token,
+        answers: Rc<RefCell<HttpAnswers>>,
+        configured_backend_timeout: Duration,
+        configured_connect_timeout: Duration,
+        configured_frontend_timeout: Duration,
+        configured_request_timeout: Duration,
+        expect_proxy: bool,
+        listener_token: Token,
+        listener: Rc<RefCell<HttpsListener>>,
         pool: Weak<RefCell<Pool>>,
         proxy: Rc<RefCell<HttpsProxy>>,
         public_address: StdSocketAddr,
-        expect_proxy: bool,
+        rustls_details: ServerConnection,
+        sock: MioTcpStream,
         sticky_name: String,
-        answers: Rc<RefCell<HttpAnswers>>,
-        listener_token: Token,
+        token: Token,
         wait_time: Duration,
-        frontend_timeout_duration: Duration,
-        backend_timeout_duration: Duration,
-        request_timeout_duration: Duration,
-        listener: Rc<RefCell<HttpsListener>>,
     ) -> HttpsSession {
         let peer_address = if expect_proxy {
             // Will be defined later once the expect proxy header has been received and parsed
@@ -143,7 +146,7 @@ impl HttpsSession {
         };
 
         let request_id = Ulid::generate();
-        let front_timeout = TimeoutContainer::new(request_timeout_duration, token);
+        let front_timeout = TimeoutContainer::new(configured_request_timeout, token);
 
         let state = if expect_proxy {
             trace!("starting in expect proxy state");
@@ -164,21 +167,23 @@ impl HttpsSession {
 
         let metrics = SessionMetrics::new(Some(wait_time));
         let mut session = HttpsSession {
+            answers,
+            configured_backend_timeout,
+            configured_connect_timeout,
+            configured_frontend_timeout,
+            configured_request_timeout,
+            container_frontend_timeout: front_timeout,
             frontend_token: token,
-            protocol: state,
-            public_address,
-            pool,
-            proxy,
-            sticky_name,
-            metrics,
             last_event: Instant::now(),
             listener_token,
-            peer_address,
-            answers,
-            frontend_timeout: front_timeout,
-            frontend_timeout_duration,
-            backend_timeout_duration,
             listener,
+            metrics,
+            peer_address,
+            pool,
+            protocol: state,
+            proxy,
+            public_address,
+            sticky_name,
         };
 
         session.front_readiness().interest = Ready::readable() | Ready::hup() | Ready::error();
@@ -300,12 +305,11 @@ impl HttpsSession {
             AlpnProtocols::Http11 => {
                 let mut http = Http::new(
                     self.answers.clone(),
-                    self.listener.borrow().config.back_timeout,
-                    self.listener.borrow().config.connect_timeout,
+                    self.configured_backend_timeout,
+                    self.configured_connect_timeout,
+                    self.configured_frontend_timeout,
+                    self.container_frontend_timeout.take(),
                     front_stream,
-                    self.frontend_timeout_duration,
-                    self.frontend_timeout.take(),
-                    // self.backend_timeout_duration,
                     self.frontend_token,
                     self.listener.clone(),
                     self.pool.clone(),
@@ -419,12 +423,12 @@ impl HttpsSession {
 
         pipe.frontend_readiness.event = http.frontend_readiness.event;
         pipe.backend_readiness.event = http.backend_readiness.event;
-        http.frontend_timeout
-            .set_duration(self.frontend_timeout_duration);
-        http.backend_timeout
-            .set_duration(self.backend_timeout_duration);
-        pipe.frontend_timeout = Some(http.frontend_timeout);
-        pipe.backend_timeout = Some(http.backend_timeout);
+        http.container_frontend_timeout
+            .set_duration(self.configured_frontend_timeout);
+        http.container_backend_timeout
+            .set_duration(self.configured_backend_timeout);
+        pipe.frontend_timeout = Some(http.container_frontend_timeout);
+        pipe.backend_timeout = Some(http.container_backend_timeout);
         pipe.set_back_token(back_token);
         pipe.set_cluster_id(http.cluster_id.clone());
 
@@ -479,7 +483,7 @@ impl HttpsSession {
     }
 
     fn cancel_timeouts(&mut self) {
-        self.frontend_timeout.cancel();
+        self.container_frontend_timeout.cancel();
 
         match self.protocol {
             State::Invalid => unreachable!(),
@@ -553,13 +557,13 @@ impl ProxySession for HttpsSession {
             State::Invalid => unreachable!(),
             State::Expect(_, _) => {
                 if token == self.frontend_token {
-                    self.frontend_timeout.triggered();
+                    self.container_frontend_timeout.triggered();
                 }
                 SessionResult::CloseSession
             }
             State::Handshake(_) => {
                 if token == self.frontend_token {
-                    self.frontend_timeout.triggered();
+                    self.container_frontend_timeout.triggered();
                 }
                 SessionResult::CloseSession
             }
@@ -1368,21 +1372,22 @@ impl ProxyConfiguration for HttpsProxy {
             })?;
 
         let session = Rc::new(RefCell::new(HttpsSession::new(
-            rustls_details,
-            frontend_sock,
-            session_token,
+            owned.answers.clone(),
+            Duration::seconds(owned.config.back_timeout as i64),
+            Duration::seconds(owned.config.connect_timeout as i64),
+            Duration::seconds(owned.config.front_timeout as i64),
+            Duration::seconds(owned.config.request_timeout as i64),
+            owned.config.expect_proxy,
+            owned.token,
+            listener.clone(),
             Rc::downgrade(&self.pool),
             proxy,
             owned.config.public_address.unwrap_or(owned.config.address),
-            owned.config.expect_proxy,
+            rustls_details,
+            frontend_sock,
             owned.config.sticky_name.clone(),
-            owned.answers.clone(),
-            Token(token.0),
+            session_token,
             wait_time,
-            Duration::seconds(owned.config.front_timeout as i64),
-            Duration::seconds(owned.config.back_timeout as i64),
-            Duration::seconds(owned.config.request_timeout as i64),
-            listener.clone(),
         )));
         entry.insert(session);
 

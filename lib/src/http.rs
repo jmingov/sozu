@@ -67,9 +67,11 @@ pub enum State {
 /// 1 session <=> 1 HTTP connection (client to sozu)
 pub struct HttpSession {
     answers: Rc<RefCell<HttpAnswers>>,
-    backend_timeout_duration: Duration,
-    frontend_timeout_duration: Duration,
-    frontend_timeout: TimeoutContainer,
+    configured_backend_timeout: Duration,
+    configured_frontend_timeout: Duration,
+    configured_request_timeout: Duration,
+    configured_connect_timeout: Duration,
+    container_frontend_timeout: TimeoutContainer,
     frontend_token: Token,
     last_event: Instant,
     listener: Rc<RefCell<HttpListener>>,
@@ -84,40 +86,42 @@ pub struct HttpSession {
 
 impl HttpSession {
     pub fn new(
-        sock: TcpStream,
-        token: Token,
+        answers: Rc<RefCell<HttpAnswers>>,
+        configured_backend_timeout: Duration,
+        configured_connect_timeout: Duration,
+        configured_frontend_timeout: Duration,
+        configured_request_timeout: Duration,
+        expect_proxy: bool,
+        listener_token: Token,
+        listener: Rc<RefCell<HttpListener>>,
         pool: Weak<RefCell<Pool>>,
         proxy: Rc<RefCell<HttpProxy>>,
         public_address: SocketAddr,
-        expect_proxy: bool,
+        sock: TcpStream,
         sticky_name: String,
-        answers: Rc<RefCell<HttpAnswers>>,
-        listener_token: Token,
+        token: Token,
         wait_time: Duration,
-        frontend_timeout_duration: Duration,
-        backend_timeout_duration: Duration,
-        request_timeout_duration: Duration,
-        listener: Rc<RefCell<HttpListener>>,
     ) -> Self {
         let request_id = Ulid::generate();
-        let mut front_timeout = TimeoutContainer::new_empty(request_timeout_duration);
+        let mut container_frontend_timeout = TimeoutContainer::new_empty(configured_request_timeout);
+
         let state = if expect_proxy {
             trace!("starting in expect proxy state");
             gauge_add!("protocol.proxy.expect", 1);
-            front_timeout.set(token);
+            container_frontend_timeout.set(token);
 
             State::Expect(ExpectProxyProtocol::new(sock, token, request_id))
         } else {
             gauge_add!("protocol.http", 1);
             let session_address = sock.peer_addr().ok();
-            let timeout = TimeoutContainer::new(request_timeout_duration, token);
+            let container_frontend_timeout = TimeoutContainer::new(configured_request_timeout, token);
             State::Http(Http::new(
                 answers.clone(),
-                listener.borrow().config.back_timeout,
-                listener.borrow().config.connect_timeout,
+                configured_backend_timeout,
+                configured_connect_timeout,
+                configured_frontend_timeout,
+                container_frontend_timeout,
                 sock,
-                frontend_timeout_duration,
-                timeout,
                 token,
                 listener.clone(),
                 pool.clone(),
@@ -131,19 +135,21 @@ impl HttpSession {
 
         let metrics = SessionMetrics::new(Some(wait_time));
         let mut session = HttpSession {
+            answers,
+            configured_backend_timeout,
+            configured_connect_timeout,
+            configured_frontend_timeout,
+            configured_request_timeout,
+            container_frontend_timeout,
+            frontend_token: token,
+            last_event: Instant::now(),
+            listener_token,
+            listener,
+            metrics,
+            pool,
             protocol: Some(state),
             proxy,
-            frontend_token: token,
-            pool,
-            metrics,
             sticky_name,
-            last_event: Instant::now(),
-            frontend_timeout: front_timeout,
-            listener_token,
-            answers,
-            frontend_timeout_duration,
-            backend_timeout_duration,
-            listener,
         };
 
         session.front_readiness().interest = Ready::readable() | Ready::hup() | Ready::error();
@@ -216,12 +222,12 @@ impl HttpSession {
 
                 pipe.frontend_readiness.event = http.frontend_readiness.event;
                 pipe.backend_readiness.event = http.backend_readiness.event;
-                http.frontend_timeout
-                    .set_duration(self.frontend_timeout_duration);
-                http.backend_timeout
-                    .set_duration(self.backend_timeout_duration);
-                pipe.frontend_timeout = Some(http.frontend_timeout);
-                pipe.backend_timeout = Some(http.backend_timeout);
+                http.container_frontend_timeout
+                    .set_duration(self.configured_frontend_timeout);
+                http.container_backend_timeout
+                    .set_duration(self.configured_backend_timeout);
+                pipe.frontend_timeout = Some(http.container_frontend_timeout);
+                pipe.backend_timeout = Some(http.container_backend_timeout);
                 pipe.set_back_token(back_token);
                 //pipe.set_cluster_id(self.cluster_id.clone());
 
@@ -239,11 +245,11 @@ impl HttpSession {
                         let readiness = expect.frontend_readiness;
                         let mut http = Http::new(
                             self.answers.clone(),
-                            self.listener.borrow().config.back_timeout,
-                            self.listener.borrow().config.connect_timeout,
+                            self.configured_backend_timeout,
+                            self.configured_connect_timeout,
+                            self.configured_frontend_timeout,
+                            self.container_frontend_timeout.take(),
                             expect.frontend,
-                            self.frontend_timeout_duration,
-                            self.frontend_timeout.take(),
                             expect.frontend_token,
                             self.listener.clone(),
                             self.pool.clone(),
@@ -313,7 +319,7 @@ impl HttpSession {
     }
 
     fn cancel_timeouts(&mut self) {
-        self.frontend_timeout.cancel();
+        self.container_frontend_timeout.cancel();
 
         match *unwrap_msg!(self.protocol.as_mut()) {
             State::Http(ref mut http) => http.cancel_timeouts(),
@@ -361,7 +367,7 @@ impl ProxySession for HttpSession {
         let res = match *unwrap_msg!(self.protocol.as_mut()) {
             State::Expect(_) => {
                 if token == self.frontend_token {
-                    self.frontend_timeout.triggered();
+                    self.container_frontend_timeout.triggered();
                 }
                 SessionResult::CloseSession
             }
@@ -970,21 +976,21 @@ impl ProxyConfiguration for HttpProxy {
         }
 
         let session = HttpSession::new(
-            frontend_sock,
-            session_token,
+            owned.answers.clone(),
+            Duration::seconds(owned.config.back_timeout as i64),
+            Duration::seconds(owned.config.connect_timeout as i64),
+            Duration::seconds(owned.config.front_timeout as i64),
+            Duration::seconds(owned.config.request_timeout as i64),
+            owned.config.expect_proxy,
+            owned.token,
+            listener.clone(),
             Rc::downgrade(&self.pool),
             proxy,
             owned.config.public_address.unwrap_or(owned.config.address),
-            owned.config.expect_proxy,
+            frontend_sock,
             owned.config.sticky_name.clone(),
-            owned.answers.clone(),
-            owned.token,
+            session_token,
             wait_time,
-            // TODO: this is redundant with Http::new()
-            Duration::seconds(owned.config.front_timeout as i64),
-            Duration::seconds(owned.config.back_timeout as i64),
-            Duration::seconds(owned.config.request_timeout as i64),
-            listener.clone(),
         );
 
         let session = Rc::new(RefCell::new(session));

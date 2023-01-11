@@ -111,17 +111,17 @@ pub struct Http<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> 
     pub backend_readiness: Readiness,
     pub backend_socket: Option<TcpStream>,
     backend_stop: Option<Instant>,
-    pub backend_timeout: TimeoutContainer,
     pub backend_token: Option<Token>,
-    configured_connect_timeout: u32,
-    configured_backend_timeout: u32,
+    pub container_backend_timeout: TimeoutContainer,
+    pub container_frontend_timeout: TimeoutContainer,
+    configured_connect_timeout: Duration,
+    configured_backend_timeout: Duration,
     closing: bool,
     pub cluster_id: Option<String>,
     connection_attempts: u8,
     pub frontend_buffer: Option<BufferQueue>,
     pub frontend_readiness: Readiness,
     pub frontend_socket: Front,
-    pub frontend_timeout: TimeoutContainer,
     frontend_timeout_duration: Duration,
     frontend_token: Token,
     keepalive_count: usize,
@@ -143,11 +143,11 @@ pub struct Http<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> 
 impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front, L> {
     pub fn new(
         answers: Rc<RefCell<answers::HttpAnswers>>,
-        configured_backend_timeout: u32,
-        configured_connect_timeout: u32,
+        configured_backend_timeout: Duration,
+        configured_connect_timeout: Duration,
+        configured_frontend_timeout_duration: Duration,
+        container_frontend_timeout: TimeoutContainer,
         frontend_socket: Front,
-        frontend_timeout_duration: Duration,
-        frontend_timeout: TimeoutContainer,
         frontend_token: Token,
         listener: Rc<RefCell<L>>,
         pool: Weak<RefCell<Pool>>,
@@ -157,6 +157,11 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
         session_address: Option<SocketAddr>,
         sticky_name: String,
     ) -> Http<Front, L> {
+        info!("Http::new() back timeout: {}", configured_backend_timeout);
+        info!(
+            "Http::new() connect timeout: {}",
+            configured_connect_timeout
+        );
         // the variable name is misleading
         let mut session = Http {
             added_request_header: None,
@@ -168,9 +173,6 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
             backend_readiness: Readiness::new(),
             backend_socket: None,
             backend_stop: None,
-            backend_timeout: TimeoutContainer::new_empty(Duration::seconds(
-                configured_backend_timeout as i64,
-            )),
             backend_token: None,
             backend: None,
             closing: false,
@@ -178,11 +180,12 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
             configured_backend_timeout,
             configured_connect_timeout,
             connection_attempts: 0,
+            container_backend_timeout: TimeoutContainer::new_empty(configured_backend_timeout),
             frontend_buffer: None,
             frontend_readiness: Readiness::new(),
             frontend_socket,
-            frontend_timeout_duration,
-            frontend_timeout,
+            frontend_timeout_duration: configured_frontend_timeout_duration,
+            container_frontend_timeout,
             frontend_token,
             keepalive_count: 0,
             listener,
@@ -240,8 +243,8 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
 
         // reset the front timeout and cancel the back timeout while we are
         // waiting for a new request
-        self.frontend_timeout.reset();
-        self.backend_timeout.cancel();
+        self.container_frontend_timeout.reset();
+        self.container_backend_timeout.cancel();
     }
 
     pub fn log_context(&self) -> LogContext {
@@ -404,8 +407,8 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
 
     pub fn set_backend_timeout(&mut self, dur: Duration) {
         if let Some(token) = self.backend_token.as_ref() {
-            self.backend_timeout.set_duration(dur);
-            self.backend_timeout.set(*token);
+            self.container_backend_timeout.set_duration(dur);
+            self.container_backend_timeout.set(*token);
         }
     }
 
@@ -824,7 +827,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
 
     /// Read content from the session
     pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-        if !self.frontend_timeout.reset() {
+        if !self.container_frontend_timeout.reset() {
             //error!("could not reset front timeout");
         }
 
@@ -1031,7 +1034,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                 // if it was the first request, the front timeout duration
                 // was set to request_timeout, which is much lower. For future
                 // requests on this connection, we can wait a bit more
-                self.frontend_timeout
+                self.container_frontend_timeout
                     .set_duration(self.frontend_timeout_duration);
 
                 SessionResult::Continue
@@ -1052,7 +1055,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                 // if it was the first request, the front timeout duration
                 // was set to request_timeout, which is much lower. For future
                 // requests on this connection, we can wait a bit more
-                self.frontend_timeout
+                self.container_frontend_timeout
                     .set_duration(self.frontend_timeout_duration);
 
                 if !self.frontend_buffer.as_ref().unwrap().needs_input() {
@@ -1504,9 +1507,9 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                     self.backend_readiness.interest.remove(Ready::writable());
 
                     // cancel the front timeout while we are waiting for the server to answer
-                    self.frontend_timeout.cancel();
+                    self.container_frontend_timeout.cancel();
                     if let Some(token) = self.backend_token.as_ref() {
-                        self.backend_timeout.set(*token);
+                        self.container_backend_timeout.set(*token);
                     }
                     ProtocolResult::Continue
                 }
@@ -1548,7 +1551,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
 
     // Read content from cluster
     pub fn backend_readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-        if !self.backend_timeout.reset() {
+        if !self.container_backend_timeout.reset() {
             error!(
                 "could not reset back timeout {:?}:\n{}",
                 self.configured_backend_timeout,
@@ -1633,8 +1636,8 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
         if let Some(ResponseState::ResponseUpgrade(_, _, ref protocol)) = self.response_state {
             debug!("got an upgrade state[{}]: {:?}", line!(), protocol);
             if compare_no_case(protocol.as_bytes(), "websocket".as_bytes()) {
-                self.frontend_timeout.reset();
-                self.backend_timeout.reset();
+                self.container_frontend_timeout.reset();
+                self.container_backend_timeout.reset();
                 return SessionResult::Upgrade;
             } else {
                 //FIXME: should we upgrade to a pipe or send an error?
@@ -1844,8 +1847,8 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                 {
                     debug!("got an upgrade state[{}]: {:?}", line!(), protocol);
                     if compare_no_case(protocol.as_bytes(), "websocket".as_bytes()) {
-                        self.frontend_timeout.reset();
-                        self.backend_timeout.reset();
+                        self.container_frontend_timeout.reset();
+                        self.container_backend_timeout.reset();
                         return SessionResult::Upgrade;
                     }
 
@@ -1874,12 +1877,12 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
     }
 
     pub fn cancel_timeouts(&mut self) {
-        self.frontend_timeout.cancel();
-        self.backend_timeout.cancel();
+        self.container_frontend_timeout.cancel();
+        self.container_backend_timeout.cancel();
     }
 
     pub fn cancel_backend_timeout(&mut self) {
-        self.backend_timeout.cancel();
+        self.container_backend_timeout.cancel();
     }
 }
 
@@ -2213,9 +2216,6 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
 
         self.backend_readiness.interest = Ready::writable() | Ready::hup() | Ready::error();
 
-        let connect_timeout =
-            time::Duration::seconds(self.listener.borrow().get_connect_timeout() as i64);
-
         self.backend_connection_status = BackendConnectionStatus::Connecting(Instant::now());
 
         match old_backend_token {
@@ -2230,7 +2230,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
                 }
 
                 self.set_backend_socket(socket, self.backend.clone());
-                self.set_backend_timeout(connect_timeout);
+                self.set_backend_timeout(self.configured_connect_timeout);
 
                 Ok(BackendConnectAction::Replace)
             }
@@ -2261,7 +2261,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
 
                 self.set_backend_socket(socket, self.backend.clone());
                 self.set_backend_token(backend_token);
-                self.set_backend_timeout(connect_timeout);
+                self.set_backend_timeout(self.configured_connect_timeout);
 
                 Ok(BackendConnectAction::New)
             }
@@ -2287,8 +2287,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
 
             // the back timeout was of connect_timeout duration before,
             // now that we're connected, move to backend_timeout duration
-            let timeout = self.backend_timeout.duration();
-            self.set_backend_timeout(timeout);
+            self.set_backend_timeout(self.configured_backend_timeout);
             self.cancel_backend_timeout();
 
             if let Some(backend) = &self.backend {
@@ -2598,7 +2597,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> SessionStat
     fn timeout(&mut self, token: Token, metrics: &mut SessionMetrics) -> SessionResult {
         //info!("got timeout for token: {:?}", token);
         if self.frontend_token == token {
-            self.frontend_timeout.triggered();
+            self.container_frontend_timeout.triggered();
             match self.timeout_status() {
                 TimeoutStatus::Request => {
                     self.set_answer(DefaultAnswerStatus::Answer408, None);
@@ -2613,7 +2612,7 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> SessionStat
             }
         } else if self.backend_token == Some(token) {
             //info!("backend timeout triggered for token {:?}", token);
-            self.backend_timeout.triggered();
+            self.container_backend_timeout.triggered();
             match self.timeout_status() {
                 TimeoutStatus::Request => {
                     error!(
