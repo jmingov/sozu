@@ -277,7 +277,12 @@ impl HttpsSession {
         let alpn = match alpn {
             Some("http/1.1") => AlpnProtocols::Http11,
             Some("h2") => AlpnProtocols::H2,
-            _ => todo!(),
+            Some(other) => {
+                error!("Unsupported ALPN protocol: {}", other);
+                return None;
+            },
+            // Some client don't fill in the ALPN protocol, in this case we default to Http/1.1
+            None => AlpnProtocols::Http11,
         };
 
         let mut front_buf = front_buf.unwrap();
@@ -587,7 +592,11 @@ impl ProxySession for HttpsSession {
 
         match &mut self.protocol {
             State::Http(http) => http.update_readiness(token, events),
-            _ => {}
+            State::Expect(expect, _) => expect.update_readiness(token, events),
+            State::Handshake(handshake) => handshake.update_readiness(token, events),
+            State::WebSocket(websocket) => websocket.update_readiness(token, events),
+            State::Http2(_) => todo!(),
+            State::Invalid => todo!(),
         }
     }
 
@@ -613,6 +622,8 @@ impl ProxySession for HttpsSession {
             ProtocolResult::Upgrade => {
                 if self.upgrade() {
                     self.ready(session);
+                } else {
+                    self.close();
                 }
             }
             ProtocolResult::Close => self.close(),

@@ -1,4 +1,6 @@
 use std::{
+    env,
+    io::stdout,
     net::SocketAddr,
     os::unix::prelude::{AsRawFd, FromRawFd, IntoRawFd},
     thread::{self, JoinHandle},
@@ -13,6 +15,7 @@ use sozu::server::Server;
 use sozu_command::{
     channel::Channel,
     config::{Config, FileConfig},
+    logging::{Logger, LoggerBackend},
     proxy::{
         Backend, Cluster, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
         LoadBalancingAlgorithms, LoadBalancingParams, PathRule, ProxyRequest, ProxyRequestOrder,
@@ -150,10 +153,6 @@ impl Worker {
 
         set_no_close_exec(scm_main_to_worker.as_raw_fd());
         set_no_close_exec(scm_worker_to_main.as_raw_fd());
-        println!("****Socket fd: {}", scm_main_to_worker.as_raw_fd());
-        println!("****Socket fd: {}", scm_worker_to_main.as_raw_fd());
-        println!("****Socket fd: {}", cmd_main_to_worker.sock.as_raw_fd());
-        println!("****Socket fd: {}", cmd_worker_to_main.sock.as_raw_fd());
 
         let scm_main_to_worker = ScmSocket::new(scm_main_to_worker.into_raw_fd())
             .expect("could not create an SCM socket");
@@ -167,7 +166,19 @@ impl Worker {
         let thread_state = state.to_owned();
         let thread_name = name.to_owned();
         let thread_scm_worker_to_main = scm_worker_to_main.to_owned();
+
+        println!("Setting up logging");
+
         let server_job = thread::spawn(move || {
+            match env::var("RUST_LOG") {
+                Ok(log_level) => Logger::init(
+                    "E2E".to_string(),
+                    &log_level,
+                    LoggerBackend::Stdout(stdout()),
+                    None,
+                ),
+                Err(_) => {}
+            }
             let mut server = Server::try_new_from_config(
                 cmd_worker_to_main,
                 thread_scm_worker_to_main,
