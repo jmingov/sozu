@@ -1,4 +1,5 @@
 use std::{
+    io::stdout,
     thread,
     time::{Duration, Instant},
 };
@@ -7,15 +8,17 @@ use serial_test::serial;
 
 use sozu_command_lib::{
     config::FileConfig,
+    info,
+    logging::{Logger, LoggerBackend},
     proxy::{
         ActivateListener, AddCertificate, CertificateAndKey, HttpFrontend, ListenerType,
-        ProxyRequestOrder,
+        ProxyRequestOrder, RemoveBackend,
     },
     state::ConfigState,
 };
 
 use crate::{
-    http_utils::http_request,
+    http_utils::{http_ok_response, http_request},
     mock::{
         aggregator::SimpleAggregator,
         async_backend::BackendHandle as AsyncBackend,
@@ -34,14 +37,14 @@ pub fn try_async(nb_backends: usize, nb_clients: usize, nb_requests: usize) -> S
 
     let (config, listeners, state) = Worker::empty_config();
     let (mut worker, mut backends) =
-        async_setup_test(config, listeners, state, front_address, nb_backends);
+        async_setup_test("ASYNC", config, listeners, state, front_address, nb_backends);
 
     let mut clients = (0..nb_clients)
         .map(|i| {
             Client::new(
                 format!("client{}", i),
                 front_address,
-                http_request("GET", "/api", format!("ping{}", i)),
+                http_request("GET", "/api", format!("ping{}", i), "localhost"),
             )
         })
         .collect::<Vec<_>>();
@@ -89,7 +92,7 @@ pub fn try_sync(nb_clients: usize, nb_requests: usize) -> State {
         .expect("could not parse front address");
 
     let (config, listeners, state) = Worker::empty_config();
-    let (mut worker, mut backends) = sync_setup_test(config, listeners, state, front_address, 1);
+    let (mut worker, mut backends) = sync_setup_test("SYNC", config, listeners, state, front_address, 1);
     let mut backend = backends.pop().unwrap();
 
     backend.connect();
@@ -99,7 +102,7 @@ pub fn try_sync(nb_clients: usize, nb_requests: usize) -> State {
             Client::new(
                 format!("client{}", i),
                 front_address,
-                http_request("GET", "/api", format!("ping{}", i)),
+                http_request("GET", "/api", format!("ping{}", i), "localhost"),
             )
         })
         .collect::<Vec<_>>();
@@ -164,7 +167,7 @@ pub fn try_backend_stop(nb_requests: usize, zombie: Option<u32>) -> State {
     });
     let listeners = Worker::empty_listeners();
     let state = ConfigState::new();
-    let (mut worker, mut backends) = async_setup_test(config, listeners, state, front_address, 2);
+    let (mut worker, mut backends) = async_setup_test("BACKSTOP", config, listeners, state, front_address, 2);
     let mut backend2 = backends.pop().expect("backend2");
     let mut backend1 = backends.pop().expect("backend1");
 
@@ -173,7 +176,11 @@ pub fn try_backend_stop(nb_requests: usize, zombie: Option<u32>) -> State {
         responses_sent: 0,
     });
 
-    let mut client = Client::new("client", front_address, http_request("GET", "/api", "ping"));
+    let mut client = Client::new(
+        "client",
+        front_address,
+        http_request("GET", "/api", "ping", "localhost"),
+    );
     client.connect();
 
     let start = Instant::now();
@@ -218,10 +225,14 @@ pub fn try_issue_810_timeout() -> State {
         .expect("could not parse front address");
 
     let (config, listeners, state) = Worker::empty_config();
-    let (mut worker, mut backends) = sync_setup_test(config, listeners, state, front_address, 1);
+    let (mut worker, mut backends) = sync_setup_test("810-TIMEOUT", config, listeners, state, front_address, 1);
     let mut backend = backends.pop().unwrap();
 
-    let mut client = Client::new("client", front_address, http_request("GET", "/api", "ping"));
+    let mut client = Client::new(
+        "client",
+        front_address,
+        http_request("GET", "/api", "ping", "localhost"),
+    );
 
     backend.connect();
     client.connect();
@@ -261,7 +272,7 @@ pub fn try_issue_810_panic(part2: bool) -> State {
         .expect("could not parse back address");
 
     let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("WORKER", config, &listeners, state);
+    let mut worker = Worker::start_new_worker("810-PANIC", config, &listeners, state);
 
     worker.send_proxy_request(ProxyRequestOrder::AddTcpListener(
         Worker::default_tcp_listener(front_address),
@@ -327,7 +338,7 @@ pub fn try_tls_endpoint() -> State {
         .expect("could not parse back address");
 
     let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("WORKER", config, &listeners, state);
+    let mut worker = Worker::start_new_worker("TLS-ENDPOINT", config, &listeners, state);
 
     worker.send_proxy_request(ProxyRequestOrder::AddHttpsListener(
         Worker::default_https_listener(front_address),
@@ -408,10 +419,14 @@ pub fn test_upgrade() -> State {
         .expect("could not parse front address");
 
     let (config, listeners, state) = Worker::empty_config();
-    let (mut worker, mut backends) = sync_setup_test(config, listeners, state, front_address, 1);
+    let (mut worker, mut backends) = sync_setup_test("UPGRADE", config, listeners, state, front_address, 1);
 
     let mut backend = backends.pop().expect("backend");
-    let mut client = Client::new("client", front_address, http_request("GET", "/api", "ping"));
+    let mut client = Client::new(
+        "client",
+        front_address,
+        http_request("GET", "/api", "ping", "localhost"),
+    );
 
     backend.connect();
     client.connect();
@@ -464,13 +479,14 @@ pub fn test_upgrade() -> State {
     State::Success
 }
 
+/*
 pub fn test_http(nb_requests: usize) {
     let front_address = "127.0.0.1:2001"
         .parse()
         .expect("could not parse front address");
 
     let (config, listeners, state) = Worker::empty_config();
-    let (mut worker, mut backends) = async_setup_test(config, listeners, state, front_address, 1);
+    let (mut worker, mut backends) = async_setup_test("HTTP", config, listeners, state, front_address, 1);
     let mut backend = backends.pop().expect("backend");
 
     let mut bad_client = Client::new(
@@ -481,7 +497,7 @@ pub fn test_http(nb_requests: usize) {
     let mut good_client = Client::new(
         format!("good_client"),
         front_address,
-        http_request("GET", "/api", "good_ping"),
+        http_request("GET", "/api", "good_ping", "localhost"),
     );
     bad_client.connect();
     good_client.connect();
@@ -513,6 +529,7 @@ pub fn test_http(nb_requests: usize) {
     let aggregator = backend.stop_and_get_aggregator();
     println!("backend aggregator: {:?}", aggregator);
 }
+*/
 
 pub fn try_hard_or_soft_stop(soft: bool) -> State {
     let front_address = "127.0.0.1:2001"
@@ -520,10 +537,14 @@ pub fn try_hard_or_soft_stop(soft: bool) -> State {
         .expect("could not parse front address");
 
     let (config, listeners, state) = Worker::empty_config();
-    let (mut worker, mut backends) = sync_setup_test(config, listeners, state, front_address, 1);
+    let (mut worker, mut backends) = sync_setup_test("STOP", config, listeners, state, front_address, 1);
     let mut backend = backends.pop().unwrap();
 
-    let mut client = Client::new("client", front_address, http_request("GET", "/api", "ping"));
+    let mut client = Client::new(
+        "client",
+        front_address,
+        http_request("GET", "/api", "ping", "localhost"),
+    );
 
     // Send a request to try out
     backend.connect();
@@ -579,15 +600,218 @@ pub fn try_hard_or_soft_stop(soft: bool) -> State {
     }
 }
 
-/*
-pub fn test_hard_vs_soft_stop() -> State {
-    let state = _test_hard_vs_soft_stop(true);
-    if state != State::Success {
-        return state;
-    }
-    _test_hard_vs_soft_stop(false)
+fn try_http_behaviors() -> State {
+    use sozu_command_lib::log;
+    Logger::init(
+        "EXAMPLE".to_string(),
+        "debug",
+        LoggerBackend::Stdout(stdout()),
+        None,
+    );
+
+    info!("starting up");
+
+    let front_address = "127.0.0.1:2001"
+        .parse()
+        .expect("could not parse front address");
+
+    let (config, listeners, state) = Worker::empty_config();
+    let mut worker = Worker::start_new_worker("HTTP", config, &listeners, state);
+
+    worker.send_proxy_request(ProxyRequestOrder::AddHttpListener(
+        Worker::default_http_listener(front_address),
+    ));
+    worker.send_proxy_request(ProxyRequestOrder::ActivateListener(ActivateListener {
+        address: front_address,
+        proxy: ListenerType::HTTP,
+        from_scm: false,
+    }));
+    worker.read_to_last();
+
+    let mut client = Client::new(
+        "client",
+        front_address,
+        http_request("GET", "/", "ping", "example.com"),
+    );
+
+    info!("expecting 404");
+    client.connect();
+    client.send();
+    let expected_response = String::from("HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n");
+    let response = client.receive();
+    println!("response: {:?}", response);
+    assert_eq!(response, Some(expected_response));
+    assert_eq!(client.receive(), None);
+
+    worker.send_proxy_request(ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
+        hostname: String::from("example.com"),
+        ..Worker::default_http_frontend("cluster_0", front_address)
+    }));
+    worker.read_to_last();
+
+    info!("expecting 503");
+    client.connect();
+    client.send();
+    let expected_response = String::from("HTTP/1.1 503 Service Unavailable\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n");
+    let response = client.receive();
+    println!("response: {:?}", response);
+    assert_eq!(response, Some(expected_response));
+    assert_eq!(client.receive(), None);
+
+    let back_address = "127.0.0.1:2002"
+        .parse()
+        .expect("could not parse back address");
+    worker.send_proxy_request(ProxyRequestOrder::AddBackend(Worker::default_backend(
+        "cluster_0",
+        format!("cluster_0-0"),
+        back_address,
+    )));
+    worker.read_to_last();
+
+    info!("sending invalid request, expecting 400");
+    client.set_request("HELLO\r\n\r\n");
+    client.connect();
+    client.send();
+
+    let expected_response = String::from("HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n");
+    let response = client.receive();
+    println!("response: {:?}", response);
+    assert_eq!(response, Some(expected_response));
+    assert_eq!(client.receive(), None);
+    
+    let mut backend = SyncBackend::new("backend", back_address, "TEST\r\n\r\n");
+    backend.connect();
+
+    info!("expecting 502");
+    client.connect();
+    client.set_request(http_request("GET", "/", "ping", "example.com"));
+    client.send();
+    backend.accept(0);
+    backend.receive(0);
+    backend.send(0);
+
+    let expected_response = String::from("HTTP/1.1 502 Bad Gateway\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n");
+    let response = client.receive();
+    println!("response: {:?}", response);
+    assert_eq!(response, Some(expected_response));
+    assert_eq!(client.receive(), None);
+
+    info!("expecting 200");
+    worker.send_proxy_request(ProxyRequestOrder::RemoveBackend(RemoveBackend {
+        cluster_id: String::from("cluster_0"),
+        backend_id: String::from("cluster_0-0"),
+        address: back_address,
+    }));
+    worker.send_proxy_request(ProxyRequestOrder::AddBackend(Worker::default_backend(
+        "cluster_0",
+        format!("cluster_0-0"),
+        back_address,
+    )));
+    backend.disconnect();
+    worker.read_to_last();
+
+    let mut backend = SyncBackend::new("backend", back_address, http_ok_response("hello"));
+    backend.connect();
+    client.connect();
+    client.send();
+    backend.accept(0);
+    backend.receive(0);
+    backend.send(0);
+
+    let expected_response_start = String::from("HTTP/1.1 200 OK\r\nContent-Length: 5");
+    let expected_response_end = String::from("hello");
+    let response = client.receive().unwrap();
+    println!("response: {:?}", response);
+    assert!(response.starts_with(&expected_response_start) && response.ends_with(&expected_response_end));
+
+    info!("expecting 200, without content length");
+    backend.response = String::from("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nHello world!");
+    client.send();
+    backend.receive(0);
+    backend.send(0);
+
+    let expected_response_start = String::from("HTTP/1.1 200 OK\r\n");
+    let expected_response_end = String::from("Hello world!");
+    let response = client.receive().unwrap();
+    println!("response: {:?}", response);
+    assert!(response.starts_with(&expected_response_start) && response.ends_with(&expected_response_end));
+
+    info!("server closes, expecting 503");
+    // TODO: what if the client continue to use the closed stream
+    client.connect();
+    client.send();
+    backend.accept(0);
+    backend.receive(0);
+    backend.close(0);
+
+    let expected_response = String::from("HTTP/1.1 503 Service Unavailable\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n");
+    let response = client.receive();
+    println!("response: {:?}", response);
+    assert_eq!(response, Some(expected_response));
+    assert_eq!(client.receive(), None);
+
+    worker.send_proxy_request(ProxyRequestOrder::RemoveBackend(RemoveBackend {
+        cluster_id: String::from("cluster_0"),
+        backend_id: String::from("cluster_0-0"),
+        address: back_address,
+    }));
+    worker.send_proxy_request(ProxyRequestOrder::AddBackend(Worker::default_backend(
+        "cluster_0",
+        format!("cluster_0-0"),
+        back_address,
+    )));
+    backend.disconnect();
+    worker.read_to_last();
+
+    let mut backend = SyncBackend::new("backend", back_address, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: WebSocket\r\n\r\n");
+
+    info!("expecting upgrade (101 switching protocols)");
+    backend.connect();
+    client.connect();
+    client.send();
+    backend.accept(0);
+    backend.receive(0);
+    backend.send(0);
+
+    let expected_response = String::from("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: WebSocket\r\n\r\n");
+    let response = client.receive();
+    println!("response: {:?}", response);
+    assert_eq!(response, Some(expected_response));
+    assert_eq!(client.receive(), None);
+
+    client.set_request("ping");
+    backend.response = String::from("pong");
+    client.send();
+    backend.receive(0);
+    backend.send(0);
+
+    let expected_response = String::from("pong");
+    let response = client.receive();
+    println!("response: {:?}", response);
+    assert_eq!(response, Some(expected_response));
+    assert_eq!(client.receive(), None);
+
+    info!("expecting 100");
+    backend.response = String::from("HTTP/1.1 100 Continue\r\nContent-Length: 1024\r\n\r\n");
+    client.set_request("GET /100 HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\nContent-Length: 0\r\nExpect: 100-continue\r\n\r\n");
+    client.connect();
+    client.send();
+    backend.accept(1);
+    backend.receive(1);
+    backend.send(1);
+
+    let expected_response_start = String::from("HTTP/1.1 100 Continue\r\nContent-Length: 1024\r\n");
+    let expected_response_end = String::from("\r\n\r\n");
+    let response = client.receive().unwrap();
+    println!("response: {:?}", response);
+    assert!(response.starts_with(&expected_response_start) && response.ends_with(&expected_response_end));
+
+    worker.send_proxy_request(ProxyRequestOrder::HardStop);
+    worker.wait_for_server_stop();
+
+    info!("good bye");
+    State::Success
 }
-*/
 
 #[serial]
 #[test]
@@ -706,6 +930,15 @@ fn test_tls_endpoint() {
             "TLS endpoint: Sōzu should decrypt an HTTPS request",
             || try_tls_endpoint()
         ),
+        State::Success
+    );
+}
+
+#[serial]
+#[test]
+fn test_http_behaviors() {
+    assert_eq!(
+        repeat_until_error_or(1, "HTTP stack", || try_http_behaviors()),
         State::Success
     );
 }

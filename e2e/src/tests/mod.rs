@@ -32,14 +32,15 @@ pub enum State {
 /// - 1 cluster ("cluster_0")
 /// - 1 HttpFrontend for "cluster_0" on `front_address`
 /// - n backends ("cluster_0-{0..n}")
-pub fn setup_test(
+pub fn setup_test<S: Into<String>>(
+    name: S,
     config: Config,
     listeners: Listeners,
     state: ConfigState,
     front_address: SocketAddr,
     nb_backends: usize,
 ) -> (Worker, Vec<SocketAddr>) {
-    let mut worker = Worker::start_new_worker("WORKER", config, &listeners, state);
+    let mut worker = Worker::start_new_worker(name, config, &listeners, state);
 
     worker.send_proxy_request(ProxyRequestOrder::AddHttpListener(
         Worker::default_http_listener(front_address),
@@ -73,14 +74,15 @@ pub fn setup_test(
     (worker, backends)
 }
 
-pub fn async_setup_test(
+pub fn async_setup_test<S: Into<String>>(
+    name: S,
     config: Config,
     listeners: Listeners,
     state: ConfigState,
     front_address: SocketAddr,
     nb_backends: usize,
 ) -> (Worker, Vec<AsyncBackend<SimpleAggregator>>) {
-    let (worker, backends) = setup_test(config, listeners, state, front_address, nb_backends);
+    let (worker, backends) = setup_test(name, config, listeners, state, front_address, nb_backends);
     let backends = backends
         .into_iter()
         .enumerate()
@@ -100,14 +102,15 @@ pub fn async_setup_test(
     (worker, backends)
 }
 
-pub fn sync_setup_test(
+pub fn sync_setup_test<S: Into<String>>(
+    name: S,
     config: Config,
     listeners: Listeners,
     state: ConfigState,
     front_address: SocketAddr,
     nb_backends: usize,
 ) -> (Worker, Vec<SyncBackend>) {
-    let (worker, backends) = setup_test(config, listeners, state, front_address, nb_backends);
+    let (worker, backends) = setup_test(name, config, listeners, state, front_address, nb_backends);
     let backends = backends
         .into_iter()
         .enumerate()

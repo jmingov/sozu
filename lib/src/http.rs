@@ -289,6 +289,7 @@ impl HttpSession {
     }
     */
 
+    // remove when close is finished
     fn front_socket(&self) -> &TcpStream {
         match *unwrap_msg!(self.protocol.as_ref()) {
             State::Http(ref http) => http.front_socket(),
@@ -389,7 +390,9 @@ impl ProxySession for HttpSession {
         self.metrics.wait_start();
 
         match &mut self.protocol {
+            Some(State::Expect(expect)) => expect.update_readiness(token, events),
             Some(State::Http(http)) => http.update_readiness(token, events),
+            Some(State::WebSocket(websocket)) => websocket.update_readiness(token, events),
             _ => {}
         }
     }

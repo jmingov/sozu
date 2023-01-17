@@ -172,7 +172,7 @@ impl Worker {
         let server_job = thread::spawn(move || {
             match env::var("RUST_LOG") {
                 Ok(log_level) => Logger::init(
-                    "E2E".to_string(),
+                    thread_name.to_owned(),
                     &log_level,
                     LoggerBackend::Stdout(stdout()),
                     None,

@@ -124,4 +124,30 @@ impl Backend {
         }
         None
     }
+
+    /// Shutdown the connection to a client
+    pub fn close(&mut self, client_id: usize) -> bool {
+        match self.clients.get_mut(&client_id) {
+            Some(stream) => match stream.shutdown(std::net::Shutdown::Both) {
+                Ok(()) => {
+                    println!("{} closed connection with {}", self.name, client_id);
+                    return true;
+                }
+                Err(error) => {
+                    println!(
+                        "{} could not close connection with {}: {}",
+                        self.name, client_id, error
+                    );
+                }
+            },
+            None => {
+                println!("no client with id {} on backend {}", client_id, self.name);
+            }
+        }
+        false
+    }
+
+    fn set_response<S1: Into<String>>(&mut self, response: S1) {
+        self.response = response.into();
+    }
 }

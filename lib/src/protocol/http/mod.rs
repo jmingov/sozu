@@ -157,12 +157,6 @@ impl<Front: SocketHandler, L: ListenerHandler + HttpListenerHandler> Http<Front,
         session_address: Option<SocketAddr>,
         sticky_name: String,
     ) -> Http<Front, L> {
-        info!("Http::new() back timeout: {}", configured_backend_timeout);
-        info!(
-            "Http::new() connect timeout: {}",
-            configured_connect_timeout
-        );
-        // the variable name is misleading
         let mut session = Http {
             added_request_header: None,
             added_response_header: String::from(""),

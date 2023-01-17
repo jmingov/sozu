@@ -101,4 +101,8 @@ impl Client {
         }
         None
     }
+
+    pub fn set_request<S1: Into<String>>(&mut self, request: S1) {
+        self.request = request.into();
+    }
 }
