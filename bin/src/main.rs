@@ -38,7 +38,7 @@ mod worker;
 
 use std::panic;
 
-use anyhow::{bail, Context};
+use anyhow::{Context};
 #[cfg(target_os = "linux")]
 use libc::{cpu_set_t, pid_t};
 
