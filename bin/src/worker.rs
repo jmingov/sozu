@@ -1,15 +1,13 @@
-#[cfg(target_os = "freebsd")]
-use std::ffi::c_void;
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
 #[cfg(target_os = "macos")]
 use std::iter::repeat;
-#[cfg(target_os = "freebsd")]
-use std::iter::repeat;
-#[cfg(target_os = "freebsd")]
-use std::mem::size_of;
 #[cfg(target_os = "macos")]
 use std::ptr::null_mut;
+#[cfg(target_os = "freebsd")]
+use std::env;
+
+
 use std::{
     fs::File,
     io::Seek,
@@ -22,10 +20,7 @@ use anyhow::{bail, Context};
 use libc::{self, pid_t};
 #[cfg(target_os = "macos")]
 use libc::{c_char, PATH_MAX};
-#[cfg(target_os = "freebsd")]
-use libc::{sysctl, CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, PATH_MAX};
-use mio::net::UnixStream;
-use nix::{self, unistd::*};
+
 
 use tempfile::tempfile;
 
@@ -176,7 +171,7 @@ pub fn begin_worker_process(
             metrics.tagged_metrics,
             metrics.prefix.clone(),
         )
-        .with_context(|| "Could not setup metrics")?;
+            .with_context(|| "Could not setup metrics")?;
     }
     let worker_to_main_scm_socket = ScmSocket::new(worker_to_main_scm_fd)
         .with_context(|| "could not create worker-to-main scm socket")?;
@@ -188,7 +183,7 @@ pub fn begin_worker_process(
         config_state,
         true,
     )
-    .with_context(|| "Could not create server from config")?;
+        .with_context(|| "Could not create server from config")?;
 
     info!("starting event loop");
     server.run();
@@ -328,26 +323,7 @@ pub fn get_executable_path() -> anyhow::Result<String> {
 }
 
 #[cfg(target_os = "freebsd")]
-pub unsafe fn get_executable_path() -> anyhow::Result<String> {
-    let mut capacity = PATH_MAX as usize;
-    let mut path: Vec<u8> = Vec::with_capacity(capacity);
-    path.extend(repeat(0).take(capacity));
-
-    let mib: Vec<i32> = vec![CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1];
-    let len = mib.len() * size_of::<i32>();
-    let element_size = size_of::<i32>();
-
-    let res = sysctl(
-        mib.as_ptr(),
-        (len / element_size) as u32,
-        path.as_mut_ptr() as *mut c_void,
-        &mut capacity,
-        std::ptr::null() as *const c_void,
-        0,
-    );
-    if res != 0 {
-        panic!("Could not retrieve the path of the executable");
-    }
-
-    Ok(String::from_raw_parts(path.as_mut_ptr(), capacity - 1, path.len()))
+pub fn get_executable_path() -> anyhow::Result<String> {
+    let path = env::current_exe().with_context(|| "failed to retrieve current executable path")?;
+    Ok(path.to_string_lossy().to_string())
 }
