@@ -7,6 +7,8 @@ use std::ptr::null_mut;
 #[cfg(target_os = "freebsd")]
 use std::env;
 
+use mio::net::UnixStream;
+use nix::{self, unistd::*};
 
 use std::{
     fs::File,
