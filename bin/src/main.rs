@@ -135,7 +135,7 @@ fn start(args: &cli::Args) -> Result<(), anyhow::Error> {
     update_process_limits(&config)?;
 
     let executable_path =
-        unsafe { get_executable_path().with_context(|| "Could not get executable path")? };
+        get_executable_path().with_context(|| "Could not get executable path")?;
     let workers =
         start_workers(executable_path, &config).with_context(|| "Failed at spawning workers")?;
 

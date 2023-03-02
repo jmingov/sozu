@@ -1,12 +1,3 @@
-#[cfg(target_os = "macos")]
-use std::ffi::CString;
-#[cfg(target_os = "macos")]
-use std::iter::repeat;
-#[cfg(target_os = "macos")]
-use std::ptr::null_mut;
-#[cfg(target_os = "freebsd")]
-use std::env;
-
 use mio::net::UnixStream;
 use nix::{self, unistd::*};
 
@@ -16,13 +7,12 @@ use std::{
     os::unix::io::{AsRawFd, FromRawFd, IntoRawFd},
     os::unix::process::CommandExt,
     process::Command,
+    env::current_exe
 };
 
-use anyhow::{bail, Context};
-use libc::{self, pid_t};
-#[cfg(target_os = "macos")]
-use libc::{c_char, PATH_MAX};
 
+use anyhow::{Context};
+use libc::{self, pid_t};
 
 use tempfile::tempfile;
 
@@ -293,39 +283,8 @@ pub fn fork_main_into_worker(
     }
 }
 
-#[cfg(target_os = "linux")]
-pub unsafe fn get_executable_path() -> anyhow::Result<String> {
-    use std::fs;
 
-    let path = fs::read_link("/proc/self/exe").with_context(|| "/proc/self/exe doesn't exist")?;
-
-    let mut path_str = match path.into_os_string().into_string() {
-        Ok(s) => s,
-        Err(_) => bail!("Failed to convert PathBuf to String"),
-    };
-
-    if path_str.ends_with(" (deleted)") {
-        // The kernel appends " (deleted)" to the symlink when the original executable has been replaced
-        let len = path_str.len();
-        path_str.truncate(len - 10)
-    }
-
-    Ok(path_str)
-}
-
-#[cfg(target_os = "macos")]
-extern "C" {
-    pub fn _NSGetExecutablePath(buf: *mut c_char, size: *mut u32) -> i32;
-}
-
-#[cfg(target_os = "macos")]
 pub fn get_executable_path() -> anyhow::Result<String> {
-    let path = env::current_exe().with_context(|| "failed to retrieve current executable path")?;
-    Ok(path.to_string_lossy().to_string())
-}
-
-#[cfg(target_os = "freebsd")]
-pub fn get_executable_path() -> anyhow::Result<String> {
-    let path = env::current_exe().with_context(|| "failed to retrieve current executable path")?;
+    let path = current_exe().with_context(|| "failed to retrieve current executable path")?;
     Ok(path.to_string_lossy().to_string())
 }

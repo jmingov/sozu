@@ -296,7 +296,7 @@ impl CommandServer {
         }
 
         let next_id = workers.len() as u32;
-        let executable_path = unsafe { get_executable_path()? };
+        let executable_path = get_executable_path()?;
         let backends_count = state.count_backends();
         let frontends_count = state.count_frontends();
 
@@ -475,7 +475,7 @@ impl CommandServer {
         let backends_count = config_state.count_backends();
         let frontends_count = config_state.count_frontends();
 
-        let executable_path = unsafe { get_executable_path()? };
+        let executable_path = get_executable_path()?;
 
         Ok(CommandServer {
             unix_listener_fd: command_socket_fd,
